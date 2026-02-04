@@ -20,8 +20,8 @@ $Config = @{
     RoundcubeDir = "C:\inetpub\wwwroot"
 
     # Roundcube connects to local IMAP/SMTP (provided by hMailServer after installation)
-    ImapHost = "ssl://127.0.0.1:993"
-    SmtpHost = "tls://127.0.0.1:587"
+    ImapHost = "127.0.0.1"
+    SmtpHost = "127.0.0.1"
   
     # MariaDB
     MariaDbMsiUrl     = "https://mirrors.accretive-networks.net/mariadb///mariadb-12.1.2/winx64-packages/mariadb-12.1.2-winx64.msi"
@@ -37,7 +37,7 @@ $Config = @{
     RoundcubeUrl      = "https://github.com/roundcube/roundcubemail/releases/download/1.6.12/roundcubemail-1.6.12-complete.tar.gz"
   
     # PHP (Windows NTS zip; you can also use your own internal mirror/version)
-    PhpZipUrl = "https://windows.php.net/downloads/releases/php-8.2.14-nts-Win32-vs16-x64.zip"
+    PhpZipUrl = "https://windows.php.net/downloads/releases/php-8.2.30-nts-Win32-vs16-x64.zip"
     PhpDir    = "C:\PHP"
   
     # hMailServer
@@ -69,6 +69,84 @@ $Config = @{
     Write-Host "Downloading: $Url"
     Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
     if (-not (Test-Path $OutFile)) { throw "Download failed: $OutFile" }
+  }
+
+  # Utility function: Extract .tar.gz (works on Windows without built-in tar)
+  function Extract-TarGz($TarGzPath, $DestDir) {
+    Add-Type -AssemblyName System.IO.Compression
+    
+    # Step 1: Decompress .gz to .tar
+    $tarPath = $TarGzPath -replace '\.gz$', ''
+    $gzStream = [System.IO.File]::OpenRead($TarGzPath)
+    $gzipStream = New-Object System.IO.Compression.GZipStream($gzStream, [System.IO.Compression.CompressionMode]::Decompress)
+    $tarStream = [System.IO.File]::Create($tarPath)
+    $gzipStream.CopyTo($tarStream)
+    $tarStream.Close()
+    $gzipStream.Close()
+    $gzStream.Close()
+    
+    # Step 2: Extract .tar (simple TAR parser for POSIX/ustar format)
+    $tarBytes = [System.IO.File]::ReadAllBytes($tarPath)
+    $pos = 0
+    while ($pos -lt $tarBytes.Length - 512) {
+      # Read 512-byte header
+      $header = $tarBytes[$pos..($pos + 511)]
+      $pos += 512
+      
+      # Check for empty block (end of archive)
+      $allZero = $true
+      for ($i = 0; $i -lt 100; $i++) { if ($header[$i] -ne 0) { $allZero = $false; break } }
+      if ($allZero) { break }
+      
+      # Extract filename (bytes 0-99)
+      $nameBytes = $header[0..99]
+      $nameEnd = [Array]::IndexOf($nameBytes, [byte]0)
+      if ($nameEnd -lt 0) { $nameEnd = 100 }
+      $name = [System.Text.Encoding]::UTF8.GetString($nameBytes, 0, $nameEnd)
+      
+      # Check for prefix (bytes 345-499) for long paths
+      $prefixBytes = $header[345..499]
+      $prefixEnd = [Array]::IndexOf($prefixBytes, [byte]0)
+      if ($prefixEnd -lt 0) { $prefixEnd = 155 }
+      $prefix = [System.Text.Encoding]::UTF8.GetString($prefixBytes, 0, $prefixEnd)
+      if ($prefix) { $name = "$prefix/$name" }
+      
+      # Extract size (bytes 124-135, octal)
+      $sizeStr = [System.Text.Encoding]::ASCII.GetString($header[124..135]).Trim([char]0, ' ')
+      $size = 0
+      if ($sizeStr) { $size = [Convert]::ToInt64($sizeStr, 8) }
+      
+      # Extract type (byte 156): '0' or null = file, '5' = directory
+      $type = [char]$header[156]
+      
+      # Build full path
+      $fullPath = Join-Path $DestDir $name.TrimStart('/')
+      
+      if ($type -eq '5' -or $name.EndsWith('/')) {
+        # Directory
+        New-Item -ItemType Directory -Force -Path $fullPath -ErrorAction SilentlyContinue | Out-Null
+      }
+      elseif ($type -eq '0' -or $type -eq [char]0) {
+        # Regular file
+        $parentDir = Split-Path $fullPath -Parent
+        if ($parentDir -and -not (Test-Path $parentDir)) {
+          New-Item -ItemType Directory -Force -Path $parentDir | Out-Null
+        }
+        if ($size -gt 0) {
+          $fileBytes = $tarBytes[$pos..($pos + $size - 1)]
+          [System.IO.File]::WriteAllBytes($fullPath, $fileBytes)
+        } else {
+          [System.IO.File]::WriteAllBytes($fullPath, @())
+        }
+      }
+      
+      # Move to next header (size rounded up to 512-byte block)
+      $blocks = [Math]::Ceiling($size / 512)
+      $pos += $blocks * 512
+    }
+    
+    # Cleanup temp .tar file
+    Remove-Item $tarPath -Force -ErrorAction SilentlyContinue
   }
   
   # Utility function: Find mysql.exe under Program Files
@@ -107,7 +185,7 @@ $Config = @{
   
   # Common extensions for Roundcube + COM for hMailServer API
   Add-Content $phpIni "`r`nextension_dir=`"$($Config.PhpDir)\ext`""
-  foreach ($ext in @("openssl","mbstring","intl","gd","curl","mysqli","pdo_mysql","zip","fileinfo","com_dotnet")) {
+  foreach ($ext in @("mbstring","intl","gd","curl","mysqli","pdo_mysql","zip","fileinfo","com_dotnet")) {
     Add-Content $phpIni "extension=$ext"
   }
   Add-Content $phpIni "date.timezone=Asia/Shanghai"
@@ -155,12 +233,13 @@ $Config = @{
   $rcTgz = Join-Path $env:TEMP "roundcube.tar.gz"
   Download-File $Config.RoundcubeUrl $rcTgz
   
-  # Windows built-in tar
+  # Extract .tar.gz (using PowerShell function for compatibility with older Windows)
   $tmpExtractRoot = Join-Path $env:TEMP "roundcube_extract"
   Remove-Item $tmpExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force -Path $tmpExtractRoot | Out-Null
   
-  tar -xzf $rcTgz -C $tmpExtractRoot
+  Write-Host "Extracting Roundcube (this may take a moment)..."
+  Extract-TarGz $rcTgz $tmpExtractRoot
   
   $extracted = Join-Path $tmpExtractRoot "roundcubemail-$($Config.RoundcubeVersion)"
   if (-not (Test-Path $extracted)) {
@@ -511,7 +590,7 @@ return [
   Write-Host "==================== DONE ===================="
   Write-Host ""
   Write-Host "URLs:"
-  Write-Host "  Roundcube Webmail: http://<YourIP>/roundcube"
+  Write-Host "  Roundcube Webmail: http://<YourIP>/"
   Write-Host "  Admin Panel:       http://<YourIP>/admin/"
   Write-Host "  Account API:       POST http://<YourIP>/api/v1/accounts"
   Write-Host ""
@@ -523,7 +602,7 @@ return [
   Write-Host "1) Copy admin panel PHP files from 'admin' folder to: $($Config.AdminDir)"
   Write-Host "2) Open hMailServer Administrator -> set admin password to: $($Config.HmailAdminPass)"
   Write-Host "3) In hMailServer Administrator -> add your domain(s) and enable needed protocols"
-  Write-Host "4) (Optional) Enable SSL on IMAP/SMTP, open firewall ports, configure DNS"
+  Write-Host "4) (Optional) Open firewall ports, configure DNS"
   Write-Host ""
   Write-Host "API Usage (JSON):"
   Write-Host '  curl -X POST http://<IP>/api/v1/accounts -H "Content-Type: application/json" -d "{\"email\":\"user@example.com\",\"password\":\"pass123\"}"'
