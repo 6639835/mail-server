@@ -63,11 +63,22 @@ $Config = @{
   }
   
   # ---------------------------
+  # Force TLS 1.2 for HTTPS downloads (required for modern servers)
+  # ---------------------------
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+
+  # ---------------------------
   # Utility function: Download
   # ---------------------------
   function Download-File($Url, $OutFile) {
     Write-Host "Downloading: $Url"
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    try {
+      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+    } catch {
+      Write-Host "Invoke-WebRequest failed, trying WebClient..." -ForegroundColor Yellow
+      $webClient = New-Object System.Net.WebClient
+      $webClient.DownloadFile($Url, $OutFile)
+    }
     if (-not (Test-Path $OutFile)) { throw "Download failed: $OutFile" }
   }
 
