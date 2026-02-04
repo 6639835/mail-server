@@ -1,7 +1,7 @@
 <# ===========================================================
 Windows Mail Stack Installer
 - IIS + PHP (FastCGI)
-- MariaDB (MSI silent with properties)
+- MySQL (MSI silent with properties)
 - Roundcube (download + config + DB init)
 - hMailServer (silent install)
 
@@ -13,7 +13,7 @@ Run as Administrator.
 # ---------------------------
 $Config = @{
     # Your domain (for documentation; Roundcube login still uses email address)
-    Domain = "example.com"
+    Domain = "dhieihe.work"
   
     # Roundcube installed as IIS site root: http://<IP>/
     WebRoot      = "C:\inetpub\wwwroot"
@@ -23,16 +23,17 @@ $Config = @{
     ImapHost = "127.0.0.1"
     SmtpHost = "127.0.0.1"
   
-    # MariaDB
-    MariaDbMsiUrl     = "https://mirrors.accretive-networks.net/mariadb///mariadb-12.1.2/winx64-packages/mariadb-12.1.2-winx64.msi"
+    # MySQL
+    # MySQL Community Server MSI (Windows x64)
+    MySqlMsiUrl       = "https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.40-winx64.msi"
     # Optional: if set, use this local MSI instead of downloading
-    MariaDbMsiPath    = ""
+    MySqlMsiPath      = ""
     # Optional: override install/data directories (recommended to keep DATADIR out of Program Files)
-    MariaDbInstallDir = ""  # e.g. "C:\MariaDB"
-    MariaDbDataDir    = "C:\ProgramData\MariaDB\data"
-    MariaDbService    = "MariaDB"
-    MariaDbPort       = 3306
-    MariaDbRootPass   = "ChangeMe_Strong_RootPass!"
+    MySqlInstallDir   = ""  # e.g. "C:\MySQL"
+    MySqlDataDir      = "C:\ProgramData\MySQL\data"
+    MySqlService      = "MySQL"
+    MySqlPort         = 3306
+    MySqlRootPass     = "ChangeMe_Strong_RootPass!"
     RoundcubeDBName   = "roundcube"
     RoundcubeDBUser   = "roundcube_user"
     RoundcubeDBPass   = "ChangeMe_Strong_RC_DBPass!"
@@ -61,6 +62,11 @@ $Config = @{
     AdminDir = "C:\inetpub\wwwroot\admin"
     AdminUsername = "admin"
     AdminPassword = "ChangeMe_Admin123!"
+
+    # Installer behavior
+    # If Windows keeps reporting a pending reboot even after multiple restarts,
+    # set this to $true to continue anyway (NOT recommended; MariaDB MSI may still fail).
+    IgnorePendingReboot = $true
   }
   
   # ---------------------------
@@ -69,6 +75,78 @@ $Config = @{
   $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
   if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Please run PowerShell as Administrator"
+  }
+
+  # ---------------------------
+  # 1.1) Pending reboot guard
+  #   MSI installs (esp. DB bootstrap) can fail when Windows is pending reboot.
+  # ---------------------------
+  function Get-PendingRebootState {
+    $reasons = New-Object System.Collections.Generic.List[string]
+    try {
+      if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+        $reasons.Add("CBS:RebootPending")
+      }
+      if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+        $reasons.Add("WindowsUpdate:RebootRequired")
+      }
+
+      $pfr = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue).PendingFileRenameOperations
+      if ($null -ne $pfr -and $pfr.Count -gt 0) {
+        $reasons.Add(("SessionManager:PendingFileRenameOperations({0})" -f $pfr.Count))
+      }
+
+      # COM-based check (often aligns with Windows Update state)
+      try {
+        $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+        if ($sysInfo -and $sysInfo.RebootRequired) {
+          $reasons.Add("Microsoft.Update.SystemInfo:RebootRequired")
+        }
+      } catch {
+        # Ignore COM errors
+      }
+    } catch {
+      # Ignore and treat as not pending
+    }
+
+    return [pscustomobject]@{
+      IsPending = ($reasons.Count -gt 0)
+      Reasons   = $reasons.ToArray()
+    }
+  }
+
+  function Test-PendingReboot {
+    return (Get-PendingRebootState).IsPending
+  }
+
+  function Show-PendingRebootState([object]$state, [string]$prefix = "  ") {
+    if (-not $state -or -not $state.IsPending) { return }
+    Write-Host "$($prefix)Pending reboot detected:" -ForegroundColor Yellow
+    foreach ($r in $state.Reasons) {
+      Write-Host "$prefix- $r" -ForegroundColor Yellow
+    }
+  }
+
+  $pendingAtStart = Get-PendingRebootState
+  if ($pendingAtStart.IsPending) {
+    Show-PendingRebootState $pendingAtStart
+    if (-not $Config.IgnorePendingReboot) {
+      $onlyPfr = ($pendingAtStart.Reasons.Count -eq 1 -and $pendingAtStart.Reasons[0] -like "SessionManager:PendingFileRenameOperations*")
+      if ($onlyPfr) {
+        Write-Host "  NOTE: Only PendingFileRenameOperations is set. This can get 'stuck' even after many reboots (e.g., failed installers/updates)." -ForegroundColor Yellow
+        Write-Host "  To inspect what's pending:" -ForegroundColor Yellow
+        Write-Host "    (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations).PendingFileRenameOperations | Select-Object -First 40" -ForegroundColor Yellow
+        Write-Host "  If you have rebooted multiple times and it still persists, you can clear it (backup first), then reboot:" -ForegroundColor Yellow
+        Write-Host "    reg export `"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager`" `"$PSScriptRoot\session-manager-backup.reg`" /y" -ForegroundColor Yellow
+        Write-Host "    Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue" -ForegroundColor Yellow
+        Write-Host "    Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations2 -ErrorAction SilentlyContinue" -ForegroundColor Yellow
+        Write-Host "    Restart-Computer" -ForegroundColor Yellow
+      }
+      $reasonText = ($pendingAtStart.Reasons -join ", ")
+      throw "A system reboot is pending (detected by: $reasonText). Please reboot Windows first, then re-run this script. If this persists after multiple reboots, set IgnorePendingReboot = `$true in the `$Config block to bypass."
+    } else {
+      Write-Host "  WARNING: IgnorePendingReboot=true; continuing despite pending reboot." -ForegroundColor Yellow
+    }
   }
 
   # Generate a strong API key if not provided (prevents unauthenticated account creation)
@@ -86,23 +164,67 @@ $Config = @{
   # ---------------------------
   function Download-File($Url, $OutFile) {
     Write-Host "Downloading: $Url"
-    try {
-      $iwrParams = @{
-        Uri         = $Url
-        OutFile     = $OutFile
-        ErrorAction = 'Stop'
+    $lastError = $null
+
+    # Prefer HTTPS, but some Windows environments can't establish TLS to certain hosts.
+    # As a last resort, retry over HTTP (insecure) for known hosts with TLS issues.
+    $urlsToTry = @($Url)
+    if ($Url -match '^https://(downloads\.mariadb\.org|dev\.mysql\.com)/') {
+      $httpUrl = $Url -replace '^https://', 'http://'
+      if ($httpUrl -ne $Url) {
+        $urlsToTry += $httpUrl
       }
-      # -UseBasicParsing is removed in PowerShell 6+
-      if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey('UseBasicParsing')) {
-        $iwrParams.UseBasicParsing = $true
-      }
-      Invoke-WebRequest @iwrParams
-    } catch {
-      Write-Host "Invoke-WebRequest failed, trying WebClient..." -ForegroundColor Yellow
-      $webClient = New-Object System.Net.WebClient
-      $webClient.DownloadFile($Url, $OutFile)
     }
-    if (-not (Test-Path $OutFile)) { throw "Download failed: $OutFile" }
+
+    foreach ($u in $urlsToTry) {
+      if ($u -ne $Url) {
+        Write-Host "  WARNING: HTTPS download failed; retrying over HTTP (insecure): $u" -ForegroundColor Yellow
+      }
+
+      Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+
+      # 1) Invoke-WebRequest
+      try {
+        $iwrParams = @{
+          Uri         = $u
+          OutFile     = $OutFile
+          ErrorAction = 'Stop'
+        }
+        # -UseBasicParsing is removed in PowerShell 6+
+        if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey('UseBasicParsing')) {
+          $iwrParams.UseBasicParsing = $true
+        }
+        Invoke-WebRequest @iwrParams
+      } catch {
+        $lastError = $_
+      }
+      if (Test-Path $OutFile) { return }
+
+      # 2) BITS (often works when .NET TLS fails / proxy environments)
+      try {
+        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+          Write-Host "Invoke-WebRequest failed, trying BITS..." -ForegroundColor Yellow
+          Start-BitsTransfer -Source $u -Destination $OutFile -ErrorAction Stop
+        }
+      } catch {
+        $lastError = $_
+      }
+      if (Test-Path $OutFile) { return }
+
+      # 3) WebClient
+      try {
+        Write-Host "BITS failed, trying WebClient..." -ForegroundColor Yellow
+        $webClient = New-Object System.Net.WebClient
+        $webClient.DownloadFile($u, $OutFile)
+      } catch {
+        $lastError = $_
+      }
+      if (Test-Path $OutFile) { return }
+    }
+
+    $msg = "Download failed: $OutFile"
+    if ($lastError) { $msg += "`nLast error: $($lastError.Exception.Message)" }
+    throw $msg
   }
 
   # Utility function: Write UTF-8 without BOM (prevents PHP "headers already sent" issues)
@@ -192,8 +314,9 @@ $Config = @{
   # Utility function: Find mysql.exe under Program Files
   function Find-MySqlExe {
     $candidates = @(
-      "C:\Program Files\MariaDB*\bin\mysql.exe",
-      "C:\Program Files (x86)\MariaDB*\bin\mysql.exe"
+      "C:\Program Files\MySQL\MySQL Server*\bin\mysql.exe",
+      "C:\Program Files (x86)\MySQL\MySQL Server*\bin\mysql.exe",
+      "C:\MySQL*\bin\mysql.exe"
     )
     foreach ($pat in $candidates) {
       $hit = Get-ChildItem -Path $pat -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -227,9 +350,27 @@ $Config = @{
   # 2) Install IIS (including FastCGI)
   # ---------------------------
   Write-Host "Installing IIS..."
-  Install-WindowsFeature Web-Server, Web-Common-Http, Web-Default-Doc, Web-Static-Content, `
+  $iisResult = Install-WindowsFeature Web-Server, Web-Common-Http, Web-Default-Doc, Web-Static-Content, `
     Web-Http-Errors, Web-Http-Redirect, Web-Http-Logging, Web-Request-Monitor, `
-    Web-Filtering, Web-App-Dev, Web-CGI, Web-Mgmt-Tools | Out-Null
+    Web-Filtering, Web-App-Dev, Web-CGI, Web-Mgmt-Tools
+
+  if ($iisResult -and ($iisResult.RestartNeeded -eq "Yes")) {
+    Write-Host "  Windows feature installation requires a reboot." -ForegroundColor Yellow
+    Write-Host "  Please reboot, then re-run: powershell -ExecutionPolicy Bypass -File .\Install-MailStack-Windows.ps1" -ForegroundColor Yellow
+    exit 3010
+  }
+
+  $pendingAfterFeatures = Get-PendingRebootState
+  if ($pendingAfterFeatures.IsPending) {
+    Show-PendingRebootState $pendingAfterFeatures
+    if (-not $Config.IgnorePendingReboot) {
+      Write-Host "  A reboot is pending after installing Windows features." -ForegroundColor Yellow
+      Write-Host "  Please reboot, then re-run: powershell -ExecutionPolicy Bypass -File .\Install-MailStack-Windows.ps1" -ForegroundColor Yellow
+      exit 3010
+    } else {
+      Write-Host "  WARNING: IgnorePendingReboot=true; continuing despite pending reboot after Windows features." -ForegroundColor Yellow
+    }
+  }
   
   # ---------------------------
   # 3) Install PHP (zip) and configure FastCGI
@@ -300,52 +441,73 @@ $Config = @{
   iisreset | Out-Null
   
   # ---------------------------
-  # 4) Install MariaDB (MSI silent + properties)
+  # 4) Install MySQL (MSI silent + properties)
   #   - PASSWORD / SERVICENAME / PORT etc. are officially supported MSI properties
   # ---------------------------
-  Write-Host "Installing MariaDB..."
+  Write-Host "Installing MySQL..."
+  $pendingBeforeMySql = Get-PendingRebootState
+  if ($pendingBeforeMySql.IsPending) {
+    Show-PendingRebootState $pendingBeforeMySql
+    if (-not $Config.IgnorePendingReboot) {
+      $reasonText = ($pendingBeforeMySql.Reasons -join ", ")
+      throw "A system reboot is pending (detected by: $reasonText). Please reboot Windows before installing MySQL, then re-run this script. If this persists after multiple reboots, set IgnorePendingReboot = `$true in the `$Config block to bypass."
+    } else {
+      Write-Host "  WARNING: IgnorePendingReboot=true; continuing MySQL install despite pending reboot." -ForegroundColor Yellow
+    }
+  }
   $existingMysql = Find-MySqlExe
   if ($existingMysql) {
-    Write-Host "  MariaDB appears to be already installed (found mysql.exe). Skipping MSI install." -ForegroundColor Yellow
+    Write-Host "  MySQL appears to be already installed (found mysql.exe). Skipping MSI install." -ForegroundColor Yellow
   } else {
-  $mariadbMsiName = "mariadb-12.1.2-winx64.msi"
-  $mariadbMsi = $null
+  function Get-UrlLeafFileName([string]$url, [string]$fallback) {
+    try {
+      $u = [System.Uri]$url
+      $leaf = [System.IO.Path]::GetFileName($u.AbsolutePath)
+      if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
+    } catch {
+      # ignore
+    }
+    return $fallback
+  }
 
-  if (-not [string]::IsNullOrWhiteSpace($Config.MariaDbMsiPath) -and (Test-Path $Config.MariaDbMsiPath)) {
-    $mariadbMsi = $Config.MariaDbMsiPath
-    Write-Host "  Using local MariaDB MSI: $mariadbMsi"
+  $mysqlMsiName = Get-UrlLeafFileName $Config.MySqlMsiUrl "mysql-winx64.msi"
+  $mysqlMsi = $null
+
+  if (-not [string]::IsNullOrWhiteSpace($Config.MySqlMsiPath) -and (Test-Path $Config.MySqlMsiPath)) {
+    $mysqlMsi = $Config.MySqlMsiPath
+    Write-Host "  Using local MySQL MSI: $mysqlMsi"
   } else {
-    $localMsi = Join-Path $PSScriptRoot $mariadbMsiName
+    $localMsi = Join-Path $PSScriptRoot $mysqlMsiName
     if (Test-Path $localMsi) {
-      $mariadbMsi = $localMsi
-      Write-Host "  Using MariaDB MSI next to script: $mariadbMsi"
+      $mysqlMsi = $localMsi
+      Write-Host "  Using MySQL MSI next to script: $mysqlMsi"
     } else {
-      $mariadbMsi = Join-Path $env:TEMP $mariadbMsiName
-      Download-File $Config.MariaDbMsiUrl $mariadbMsi
+      $mysqlMsi = Join-Path $env:TEMP $mysqlMsiName
+      Download-File $Config.MySqlMsiUrl $mysqlMsi
     }
   }
   
   # If the requested port is already in use, pick the next available port.
-  if (Test-LocalTcpPortInUse ([int]$Config.MariaDbPort)) {
-    $originalPort = [int]$Config.MariaDbPort
-    Write-Host "  WARNING: MariaDB port $originalPort is already in use. Selecting a free port..." -ForegroundColor Yellow
+  if (Test-LocalTcpPortInUse ([int]$Config.MySqlPort)) {
+    $originalPort = [int]$Config.MySqlPort
+    Write-Host "  WARNING: MySQL port $originalPort is already in use. Selecting a free port..." -ForegroundColor Yellow
     $picked = $false
     for ($p = $originalPort + 1; $p -le ($originalPort + 50); $p++) {
       if (-not (Test-LocalTcpPortInUse $p)) {
-        $Config.MariaDbPort = $p
+        $Config.MySqlPort = $p
         $picked = $true
         break
       }
     }
     if ($picked) {
-      Write-Host "  Using MariaDB port: $($Config.MariaDbPort)" -ForegroundColor Yellow
+      Write-Host "  Using MySQL port: $($Config.MySqlPort)" -ForegroundColor Yellow
     } else {
-      throw "MariaDB port $originalPort is in use and no free port was found nearby. Please stop the conflicting service or set MariaDbPort."
+      throw "MySQL port $originalPort is in use and no free port was found nearby. Please stop the conflicting service or set MySqlPort."
     }
   }
 
-  $mariaLog = Join-Path $env:TEMP ("mariadb-install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-  Write-Host "  MariaDB MSI log: $mariaLog"
+  $mysqlLog = Join-Path $env:TEMP ("mysql-install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+  Write-Host "  MySQL MSI log: $mysqlLog"
 
   function Normalize-WindowsDir([string]$path) {
     if ([string]::IsNullOrWhiteSpace($path)) { return $path }
@@ -362,29 +524,57 @@ $Config = @{
   }
 
   # Ensure DATADIR exists (recommended to keep it out of Program Files)
-  if (-not [string]::IsNullOrWhiteSpace($Config.MariaDbDataDir)) {
-    New-Item -ItemType Directory -Force -Path $Config.MariaDbDataDir | Out-Null
+  if (-not [string]::IsNullOrWhiteSpace($Config.MySqlDataDir)) {
+    New-Item -ItemType Directory -Force -Path $Config.MySqlDataDir | Out-Null
   }
 
   # Build argument list as an array to avoid quoting issues
-  $msiArgs = @("/i", "`"$mariadbMsi`"")
-  $msiArgs += "SERVICENAME=$($Config.MariaDbService)"
-  $msiArgs += "PASSWORD=$($Config.MariaDbRootPass)"
-  $msiArgs += "PORT=$($Config.MariaDbPort)"
+  # MySQL MSI uses different property names than MariaDB
+  $msiArgs = @("/i", "`"$mysqlMsi`"")
+  $msiArgs += "SERVICENAME=$($Config.MySqlService)"
+  $msiArgs += "MYSQLROOTPASSWORD=$($Config.MySqlRootPass)"
+  $msiArgs += "MYSQLPORT=$($Config.MySqlPort)"
 
-  $installDirProp = Quote-MsiProperty "INSTALLDIR" $Config.MariaDbInstallDir
+  $installDirProp = Quote-MsiProperty "INSTALLDIR" $Config.MySqlInstallDir
   if ($installDirProp) { $msiArgs += $installDirProp }
-  $dataDirProp = Quote-MsiProperty "DATADIR" $Config.MariaDbDataDir
+  $dataDirProp = Quote-MsiProperty "DATADIR" $Config.MySqlDataDir
   if ($dataDirProp) { $msiArgs += $dataDirProp }
 
-  $msiArgs += @("/qn", "/l*v", "`"$mariaLog`"")
+  $msiArgs += @("/qn", "/l*v", "`"$mysqlLog`"")
 
-  $mariaInstall = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-  if ($mariaInstall.ExitCode -ne 0) {
-    throw "MariaDB installer failed (exit code: $($mariaInstall.ExitCode)). Please send the log content from: $mariaLog"
+  $mysqlInstall = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+  if ($mysqlInstall.ExitCode -ne 0) {
+    throw "MySQL installer failed (exit code: $($mysqlInstall.ExitCode)). Please send the log content from: $mysqlLog"
   }
   }
   
+  # Verify MySQL service is installed and running (helps catch silent MSI failures early)
+  $mysqlSvc = Get-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
+  if (-not $mysqlSvc) {
+    Write-Host "  WARNING: MySQL service '$($Config.MySqlService)' was not found after install." -ForegroundColor Yellow
+    Write-Host "  If MySQL is already installed with a different service name, set MySqlService accordingly." -ForegroundColor Yellow
+    Write-Host "  MSI log (if it just ran): $mysqlLog" -ForegroundColor Yellow
+  } else {
+    if ($mysqlSvc.Status -ne "Running") {
+      Write-Host "  Starting MySQL service '$($Config.MySqlService)'..."
+      Start-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 2
+      $mysqlSvc = Get-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
+    }
+    Write-Host "  MySQL service status: $($mysqlSvc.Status)"
+
+    # Wait briefly for the port to become active
+    $waitSeconds = 0
+    while ($waitSeconds -lt 20 -and -not (Test-LocalTcpPortInUse ([int]$Config.MySqlPort))) {
+      Start-Sleep -Seconds 1
+      $waitSeconds++
+    }
+    if (-not (Test-LocalTcpPortInUse ([int]$Config.MySqlPort))) {
+      Write-Host "  WARNING: MySQL port $($Config.MySqlPort) does not appear to be listening yet." -ForegroundColor Yellow
+      Write-Host "  If Roundcube DB init fails, check MySQL error logs under: $($Config.MySqlDataDir)" -ForegroundColor Yellow
+    }
+  }
+
   Start-Sleep -Seconds 3
   
   # ---------------------------
@@ -453,7 +643,7 @@ $Config = @{
   
   $configPhp = @"
 <?php
-`$config['db_dsnw'] = 'mysql://$($Config.RoundcubeDBUser):$($Config.RoundcubeDBPass)@localhost:$($Config.MariaDbPort)/$($Config.RoundcubeDBName)';
+`$config['db_dsnw'] = 'mysql://$($Config.RoundcubeDBUser):$($Config.RoundcubeDBPass)@localhost:$($Config.MySqlPort)/$($Config.RoundcubeDBName)';
 `$config['default_host'] = '$($Config.ImapHost)';
 `$config['smtp_server']  = '$($Config.SmtpHost)';
 `$config['smtp_user']    = '%u';
@@ -476,16 +666,16 @@ $Config = @{
   # ---------------------------
   Write-Host "Initializing Roundcube database..."
 
-  # Ensure MariaDB service is running before connecting
-  $mariaSvc = Get-Service -Name $Config.MariaDbService -ErrorAction SilentlyContinue
-  if ($mariaSvc -and $mariaSvc.Status -ne "Running") {
-    Write-Host "  Starting MariaDB service..."
-    Start-Service -Name $Config.MariaDbService -ErrorAction Stop
-    $mariaSvc.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+  # Ensure MySQL service is running before connecting
+  $mysqlSvc = Get-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
+  if ($mysqlSvc -and $mysqlSvc.Status -ne "Running") {
+    Write-Host "  Starting MySQL service..."
+    Start-Service -Name $Config.MySqlService -ErrorAction Stop
+    $mysqlSvc.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
   }
 
   $mysqlExe = Find-MySqlExe
-  if (-not $mysqlExe) { throw "mysql.exe not found (MariaDB installation may have failed or path differs)" }
+  if (-not $mysqlExe) { throw "mysql.exe not found (MySQL installation may have failed or path differs)" }
   
   function Escape-MySqlString([string]$value) {
     if ($null -eq $value) { return '' }
@@ -512,9 +702,9 @@ FLUSH PRIVILEGES;
 
   $mysqlRootArgs = @(
     "-uroot",
-    "-p$($Config.MariaDbRootPass)",
+    "-p$($Config.MySqlRootPass)",
     "-h", "127.0.0.1",
-    "-P", "$($Config.MariaDbPort)"
+    "-P", "$($Config.MySqlPort)"
   )
 
   & $mysqlExe @mysqlRootArgs -e $bootstrapSql
