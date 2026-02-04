@@ -27,6 +27,9 @@ $Config = @{
     MariaDbMsiUrl     = "https://mirrors.accretive-networks.net/mariadb///mariadb-12.1.2/winx64-packages/mariadb-12.1.2-winx64.msi"
     # Optional: if set, use this local MSI instead of downloading
     MariaDbMsiPath    = ""
+    # Optional: override install/data directories (recommended to keep DATADIR out of Program Files)
+    MariaDbInstallDir = ""  # e.g. "C:\MariaDB"
+    MariaDbDataDir    = "C:\ProgramData\MariaDB\data"
     MariaDbService    = "MariaDB"
     MariaDbPort       = 3306
     MariaDbRootPass   = "ChangeMe_Strong_RootPass!"
@@ -344,18 +347,37 @@ $Config = @{
   $mariaLog = Join-Path $env:TEMP ("mariadb-install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
   Write-Host "  MariaDB MSI log: $mariaLog"
 
+  function Normalize-WindowsDir([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $path }
+    return $path.TrimEnd('\', '/')
+  }
+
+  function Quote-MsiProperty([string]$name, [string]$value) {
+    $v = Normalize-WindowsDir $value
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    if ($v -match '\s') {
+      return "$name=`"$v`""
+    }
+    return "$name=$v"
+  }
+
+  # Ensure DATADIR exists (recommended to keep it out of Program Files)
+  if (-not [string]::IsNullOrWhiteSpace($Config.MariaDbDataDir)) {
+    New-Item -ItemType Directory -Force -Path $Config.MariaDbDataDir | Out-Null
+  }
+
   # Build argument list as an array to avoid quoting issues
-  $msiArgs = @(
-    "/i", "`"$mariadbMsi`"",
-    "SERVICENAME=$($Config.MariaDbService)",
-    "PASSWORD=$($Config.MariaDbRootPass)",
-    "PORT=$($Config.MariaDbPort)",
-    "ALLOWREMOTEROOTACCESS=",
-    "DEFAULTUSER=",
-    "SKIPNETWORKING=",
-    "/qn",
-    "/l*v", "`"$mariaLog`""
-  )
+  $msiArgs = @("/i", "`"$mariadbMsi`"")
+  $msiArgs += "SERVICENAME=$($Config.MariaDbService)"
+  $msiArgs += "PASSWORD=$($Config.MariaDbRootPass)"
+  $msiArgs += "PORT=$($Config.MariaDbPort)"
+
+  $installDirProp = Quote-MsiProperty "INSTALLDIR" $Config.MariaDbInstallDir
+  if ($installDirProp) { $msiArgs += $installDirProp }
+  $dataDirProp = Quote-MsiProperty "DATADIR" $Config.MariaDbDataDir
+  if ($dataDirProp) { $msiArgs += $dataDirProp }
+
+  $msiArgs += @("/qn", "/l*v", "`"$mariaLog`"")
 
   $mariaInstall = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
   if ($mariaInstall.ExitCode -ne 0) {
