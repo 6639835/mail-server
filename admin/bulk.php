@@ -325,7 +325,7 @@ if ($connectionError):
                     <div class="card mb-4">
                         <div class="card-header d-flex justify-content-between align-items-center">
                             <span><i class="bi bi-check-circle text-success me-2"></i>Created Accounts</span>
-                            <button type="button" class="btn btn-sm btn-outline-primary" onclick="copyToClipboard()">
+                            <button type="button" class="btn btn-sm btn-outline-primary" onclick="copyToClipboard(this)">
                                 <i class="bi bi-clipboard me-1"></i> Copy All
                             </button>
                         </div>
@@ -441,13 +441,12 @@ if ($connectionError):
         });
         
         // Copy to clipboard
-        function copyToClipboard() {
+        function copyToClipboard(btn) {
             const copyData = document.getElementById('copyData');
             copyData.select();
             document.execCommand('copy');
             
             // Show feedback
-            const btn = event.target.closest('button');
             const originalHtml = btn.innerHTML;
             btn.innerHTML = '<i class="bi bi-check me-1"></i> Copied!';
             btn.classList.replace('btn-outline-primary', 'btn-success');

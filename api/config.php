@@ -21,9 +21,9 @@ return [
     /**
      * API Authentication
      * Simple API key for intranet environments
-     * Set to empty string to disable authentication
+     * Set to empty string ONLY if this API is not reachable by untrusted clients
      */
-    'api_key' => '',
+    'api_key' => 'ChangeMe_API_KEY',
 
     /**
      * Allowed domains for account creation

@@ -14,10 +14,17 @@ function initSession(array $config): void
 {
     if (session_status() === PHP_SESSION_NONE) {
         session_name($config['session_name'] ?? 'MAILSERVER_ADMIN');
+        $secure = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off');
+        if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+            $proto = strtolower(trim(explode(',', (string)$_SERVER['HTTP_X_FORWARDED_PROTO'])[0]));
+            if ($proto === 'https') {
+                $secure = true;
+            }
+        }
         session_set_cookie_params([
             'lifetime' => 0, // Session cookie (expires when browser closes)
             'path' => '/',
-            'secure' => false, // Set to true if using HTTPS
+            'secure' => $secure,
             'httponly' => true,
             'samesite' => 'Strict',
         ]);
@@ -70,6 +77,7 @@ function attemptLogin(string $username, string $password, array $config): bool
     }
     
     if ($username === $validUsername && $password === $validPassword) {
+        session_regenerate_id(true);
         $_SESSION['admin_logged_in'] = true;
         $_SESSION['admin_username'] = $username;
         $_SESSION['last_activity'] = time();

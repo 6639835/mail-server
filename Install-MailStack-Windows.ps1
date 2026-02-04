@@ -25,6 +25,8 @@ $Config = @{
   
     # MariaDB
     MariaDbMsiUrl     = "https://mirrors.accretive-networks.net/mariadb///mariadb-12.1.2/winx64-packages/mariadb-12.1.2-winx64.msi"
+    # Optional: if set, use this local MSI instead of downloading
+    MariaDbMsiPath    = ""
     MariaDbService    = "MariaDB"
     MariaDbPort       = 3306
     MariaDbRootPass   = "ChangeMe_Strong_RootPass!"
@@ -37,16 +39,20 @@ $Config = @{
     RoundcubeUrl      = "https://github.com/roundcube/roundcubemail/releases/download/1.6.12/roundcubemail-1.6.12-complete.tar.gz"
   
     # PHP (Windows NTS zip; you can also use your own internal mirror/version)
-    PhpZipUrl = "https://windows.php.net/downloads/releases/php-8.2.30-nts-Win32-vs16-x64.zip"
+    # IMPORTANT: hMailServer's COM API is 32-bit only, so PHP must be x86 for COM integration to work.
+    PhpZipUrl = "https://windows.php.net/downloads/releases/php-8.2.30-nts-Win32-vs16-x86.zip"
     PhpDir    = "C:\PHP"
   
     # hMailServer
     HmailExeUrl = "https://www.hmailserver.com/files/hMailServer-5.6.8-B2574.exe"
+    # Optional: if set, use this local EXE instead of downloading
+    HmailExePath = ""
     HmailInstallDir = "C:\Program Files (x86)\hMailServer"
     HmailAdminPass = "ChangeMe_HMailAdmin!"
 
     # Mail API (for programmatic account registration)
     ApiDir = "C:\inetpub\wwwroot\api"
+    ApiKey = ""  # leave empty to auto-generate a strong key
 
     # Admin Panel
     AdminDir = "C:\inetpub\wwwroot\admin"
@@ -61,6 +67,11 @@ $Config = @{
   if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Please run PowerShell as Administrator"
   }
+
+  # Generate a strong API key if not provided (prevents unauthenticated account creation)
+  if ([string]::IsNullOrWhiteSpace($Config.ApiKey)) {
+    $Config.ApiKey = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
+  }
   
   # ---------------------------
   # Force TLS 1.2 for HTTPS downloads (required for modern servers)
@@ -73,13 +84,28 @@ $Config = @{
   function Download-File($Url, $OutFile) {
     Write-Host "Downloading: $Url"
     try {
-      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+      $iwrParams = @{
+        Uri         = $Url
+        OutFile     = $OutFile
+        ErrorAction = 'Stop'
+      }
+      # -UseBasicParsing is removed in PowerShell 6+
+      if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey('UseBasicParsing')) {
+        $iwrParams.UseBasicParsing = $true
+      }
+      Invoke-WebRequest @iwrParams
     } catch {
       Write-Host "Invoke-WebRequest failed, trying WebClient..." -ForegroundColor Yellow
       $webClient = New-Object System.Net.WebClient
       $webClient.DownloadFile($Url, $OutFile)
     }
     if (-not (Test-Path $OutFile)) { throw "Download failed: $OutFile" }
+  }
+
+  # Utility function: Write UTF-8 without BOM (prevents PHP "headers already sent" issues)
+  function Write-TextFileUtf8NoBom([string]$Path, [string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
   }
 
   # Utility function: Extract .tar.gz (works on Windows without built-in tar)
@@ -195,11 +221,13 @@ $Config = @{
   Copy-Item $phpIniProd $phpIni -Force
   
   # Common extensions for Roundcube + COM for hMailServer API
-  Add-Content $phpIni "`r`nextension_dir=`"$($Config.PhpDir)\ext`""
-  foreach ($ext in @("mbstring","intl","gd","curl","mysqli","pdo_mysql","zip","fileinfo","com_dotnet")) {
-    Add-Content $phpIni "extension=$ext"
+  Add-Content -Path $phpIni -Value "`r`nextension_dir=`"$($Config.PhpDir)\ext`"" -Encoding ASCII
+  foreach ($ext in @("mbstring","intl","gd","curl","mysqli","pdo_mysql","zip","fileinfo","exif","openssl","sockets","com_dotnet")) {
+    Add-Content -Path $phpIni -Value "extension=$ext" -Encoding ASCII
   }
-  Add-Content $phpIni "date.timezone=Asia/Shanghai"
+  Add-Content -Path $phpIni -Value "date.timezone=Asia/Shanghai" -Encoding ASCII
+  Add-Content -Path $phpIni -Value "com.allow_dcom = true" -Encoding ASCII
+  Add-Content -Path $phpIni -Value "com.autoregister_typelib = true" -Encoding ASCII
   
   Import-Module WebAdministration
   $phpCgi = Join-Path $Config.PhpDir "php-cgi.exe"
@@ -212,6 +240,13 @@ $Config = @{
   # Map .php to FastCGI
   New-WebHandler -Name "PHP_via_FastCGI" -Path "*.php" -Verb "*" -Modules "FastCgiModule" `
     -ScriptProcessor $phpCgi -ResourceType "Either" -ErrorAction SilentlyContinue | Out-Null
+
+  # Ensure index.php is a default document (so http://<IP>/ loads Roundcube)
+  Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/defaultDocument/files" -Name "." -Value @{value="index.php"} -ErrorAction SilentlyContinue | Out-Null
+
+  # Roundcube Elastic skin fonts (IIS may not include these MIME types by default)
+  Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/staticContent" -Name "." -Value @{fileExtension=".woff"; mimeType="application/font-woff"} -ErrorAction SilentlyContinue | Out-Null
+  Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/staticContent" -Name "." -Value @{fileExtension=".woff2"; mimeType="application/font-woff2"} -ErrorAction SilentlyContinue | Out-Null
   
   iisreset | Out-Null
   
@@ -220,8 +255,22 @@ $Config = @{
   #   - PASSWORD / SERVICENAME / PORT etc. are officially supported MSI properties
   # ---------------------------
   Write-Host "Installing MariaDB..."
-  $mariadbMsi = Join-Path $env:TEMP "mariadb.msi"
-  Download-File $Config.MariaDbMsiUrl $mariadbMsi
+  $mariadbMsiName = "mariadb-12.1.2-winx64.msi"
+  $mariadbMsi = $null
+
+  if (-not [string]::IsNullOrWhiteSpace($Config.MariaDbMsiPath) -and (Test-Path $Config.MariaDbMsiPath)) {
+    $mariadbMsi = $Config.MariaDbMsiPath
+    Write-Host "  Using local MariaDB MSI: $mariadbMsi"
+  } else {
+    $localMsi = Join-Path $PSScriptRoot $mariadbMsiName
+    if (Test-Path $localMsi) {
+      $mariadbMsi = $localMsi
+      Write-Host "  Using MariaDB MSI next to script: $mariadbMsi"
+    } else {
+      $mariadbMsi = Join-Path $env:TEMP $mariadbMsiName
+      Download-File $Config.MariaDbMsiUrl $mariadbMsi
+    }
+  }
   
   $msiArgs = @(
     "/i `"$mariadbMsi`"",
@@ -231,7 +280,10 @@ $Config = @{
     "PORT=$($Config.MariaDbPort)"
   ) -join " "
   
-  Start-Process msiexec.exe -ArgumentList $msiArgs -Wait
+  $mariaInstall = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+  if ($mariaInstall.ExitCode -ne 0) {
+    throw "MariaDB installer failed (exit code: $($mariaInstall.ExitCode))"
+  }
   
   Start-Sleep -Seconds 3
   
@@ -260,6 +312,37 @@ $Config = @{
   # Deploy to IIS directory (overwrite)
   Remove-Item $Config.RoundcubeDir -Recurse -Force -ErrorAction SilentlyContinue
   Copy-Item $extracted $Config.RoundcubeDir -Recurse -Force
+
+  # Roundcube requires temp/ and logs/ to be writable by the web server user (IIS)
+  foreach ($dirName in @("temp", "logs")) {
+    $dirPath = Join-Path $Config.RoundcubeDir $dirName
+    New-Item -ItemType Directory -Force -Path $dirPath | Out-Null
+    $acl = Get-Acl $dirPath
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $acl.SetAccessRule($rule)
+    Set-Acl $dirPath $acl
+  }
+
+  # IIS doesn't process Roundcube's .htaccess, so block HTTP access to private folders
+  $denyWebConfig = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <system.webServer>
+    <security>
+      <authorization>
+        <deny users="*" />
+      </authorization>
+    </security>
+  </system.webServer>
+</configuration>
+"@
+
+  foreach ($subDir in @("config", "temp", "logs", "SQL")) {
+    $dir = Join-Path $Config.RoundcubeDir $subDir
+    if (Test-Path $dir) {
+      Write-TextFileUtf8NoBom (Join-Path $dir "web.config") $denyWebConfig
+    }
+  }
   
   # Generate Roundcube config (separate config: DB/IMAP/SMTP all here)
   $rcConfigDir = Join-Path $Config.RoundcubeDir "config"
@@ -269,44 +352,82 @@ $Config = @{
   $desKey = [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
   
   $configPhp = @"
-  <?php
-  \$config['db_dsnw'] = 'mysql://$($Config.RoundcubeDBUser):$($Config.RoundcubeDBPass)@localhost:$($Config.MariaDbPort)/$($Config.RoundcubeDBName)';
-  \$config['default_host'] = '$($Config.ImapHost)';
-  \$config['smtp_server']  = '$($Config.SmtpHost)';
-  \$config['smtp_user']    = '%u';
-  \$config['smtp_pass']    = '%p';
-  \$config['product_name'] = 'Webmail';
-  \$config['des_key'] = '$desKey';
-  \$config['plugins'] = ['archive','zipdownload'];
-  \$config['language'] = 'en_US';
-  \$config['enable_installer'] = false;
-  "@
-  Set-Content -Path $rcConfig -Value $configPhp -Encoding UTF8
+<?php
+`$config['db_dsnw'] = 'mysql://$($Config.RoundcubeDBUser):$($Config.RoundcubeDBPass)@localhost:$($Config.MariaDbPort)/$($Config.RoundcubeDBName)';
+`$config['default_host'] = '$($Config.ImapHost)';
+`$config['smtp_server']  = '$($Config.SmtpHost)';
+`$config['smtp_user']    = '%u';
+`$config['smtp_pass']    = '%p';
+`$config['product_name'] = 'Webmail';
+`$config['des_key'] = '$desKey';
+`$config['plugins'] = ['archive','zipdownload'];
+`$config['language'] = 'en_US';
+`$config['log_dir']  = __DIR__ . '/../logs';
+`$config['temp_dir'] = __DIR__ . '/../temp';
+`$config['enable_installer'] = false;
+"@
+  Write-TextFileUtf8NoBom $rcConfig $configPhp
+
+  # Defense-in-depth: remove installer directory entirely
+  Remove-Item (Join-Path $Config.RoundcubeDir "installer") -Recurse -Force -ErrorAction SilentlyContinue
   
   # ---------------------------
   # 6) Initialize Roundcube database (create DB/user + import schema)
   # ---------------------------
   Write-Host "Initializing Roundcube database..."
+
+  # Ensure MariaDB service is running before connecting
+  $mariaSvc = Get-Service -Name $Config.MariaDbService -ErrorAction SilentlyContinue
+  if ($mariaSvc -and $mariaSvc.Status -ne "Running") {
+    Write-Host "  Starting MariaDB service..."
+    Start-Service -Name $Config.MariaDbService -ErrorAction Stop
+    $mariaSvc.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+  }
+
   $mysqlExe = Find-MySqlExe
   if (-not $mysqlExe) { throw "mysql.exe not found (MariaDB installation may have failed or path differs)" }
   
-  # Create DB + user
-  $sql = @"
-  CREATE DATABASE IF NOT EXISTS `$($Config.RoundcubeDBName)` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-  CREATE USER IF NOT EXISTS '$($Config.RoundcubeDBUser)'@'localhost' IDENTIFIED BY '$($Config.RoundcubeDBPass)';
-  GRANT ALL PRIVILEGES ON `$($Config.RoundcubeDBName)`.* TO '$($Config.RoundcubeDBUser)'@'localhost';
-  FLUSH PRIVILEGES;
-  "@
-  $sqlFile = Join-Path $env:TEMP "roundcube_bootstrap.sql"
-  Set-Content -Path $sqlFile -Value $sql -Encoding UTF8
-  
-  & $mysqlExe -uroot -p$($Config.MariaDbRootPass) -e "source $sqlFile"
+  function Escape-MySqlString([string]$value) {
+    if ($null -eq $value) { return '' }
+    return $value.Replace('\', '\\').Replace("'", "''")
+  }
+
+  function Quote-MySqlIdentifier([string]$value) {
+    if ($null -eq $value) { return '``' }
+    return ('`' + $value.Replace('`', '``') + '`')
+  }
+
+  $dbName = $Config.RoundcubeDBName
+  $dbNameQuoted = Quote-MySqlIdentifier $dbName
+  $dbUserEsc = Escape-MySqlString $Config.RoundcubeDBUser
+  $dbPassEsc = Escape-MySqlString $Config.RoundcubeDBPass
+
+  # Create DB + user (no temp SQL files; avoids UTF-8 BOM and quoting issues)
+  $bootstrapSql = @"
+CREATE DATABASE IF NOT EXISTS $dbNameQuoted DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$dbUserEsc'@'localhost' IDENTIFIED BY '$dbPassEsc';
+GRANT ALL PRIVILEGES ON $dbNameQuoted.* TO '$dbUserEsc'@'localhost';
+FLUSH PRIVILEGES;
+"@
+
+  $mysqlRootArgs = @(
+    "-uroot",
+    "-p$($Config.MariaDbRootPass)",
+    "-h", "127.0.0.1",
+    "-P", "$($Config.MariaDbPort)"
+  )
+
+  & $mysqlExe @mysqlRootArgs -e $bootstrapSql
+  if ($LASTEXITCODE -ne 0) { throw "Roundcube DB bootstrap failed (mysql exit code: $LASTEXITCODE)" }
   
   # Import Roundcube schema (MySQL/MariaDB)
   $schema = Join-Path $Config.RoundcubeDir "SQL\mysql.initial.sql"
   if (-not (Test-Path $schema)) { throw "Roundcube schema not found: $schema" }
-  
-  & $mysqlExe -uroot -p$($Config.MariaDbRootPass) $Config.RoundcubeDBName < $schema
+
+  $schemaPath = $schema.Replace('\', '/')
+  $sourceStmt = "source `"$schemaPath`""
+  & $mysqlExe @mysqlRootArgs $dbName -e $sourceStmt
+  if ($LASTEXITCODE -ne 0) { throw "Roundcube schema import failed (mysql exit code: $LASTEXITCODE)" }
   
   # ---------------------------
   # 7) Install hMailServer (silent)
@@ -317,10 +438,23 @@ $Config = @{
     Write-Host "hMailServer already installed, skipping..."
   } else {
     Write-Host "Installing hMailServer..."
-    $hmailExe = Join-Path $env:TEMP "hmailserver.exe"
+    $hmailInstallerName = "hMailServer-5.6.8-B2574.exe"
+    $hmailExe = $null
     
-    # Download hMailServer installer
-    Download-File $Config.HmailExeUrl $hmailExe
+    if (-not [string]::IsNullOrWhiteSpace($Config.HmailExePath) -and (Test-Path $Config.HmailExePath)) {
+      $hmailExe = $Config.HmailExePath
+      Write-Host "  Using local hMailServer installer: $hmailExe"
+    } else {
+      $localHmail = Join-Path $PSScriptRoot $hmailInstallerName
+      if (Test-Path $localHmail) {
+        $hmailExe = $localHmail
+        Write-Host "  Using hMailServer installer next to script: $hmailExe"
+      } else {
+        $hmailExe = Join-Path $env:TEMP $hmailInstallerName
+        # Download hMailServer installer
+        Download-File $Config.HmailExeUrl $hmailExe
+      }
+    }
     
     # Run silent installation
     Write-Host "  Running hMailServer installer (this may take a few minutes)..."
@@ -340,8 +474,10 @@ $Config = @{
       Write-Host "  Expected path: $hmailServerExe" -ForegroundColor Yellow
     }
     
-    # Clean up installer
-    Remove-Item $hmailExe -ErrorAction SilentlyContinue
+    # Clean up installer (only if we downloaded it to TEMP)
+    if ($hmailExe -like (Join-Path $env:TEMP '*')) {
+      Remove-Item $hmailExe -ErrorAction SilentlyContinue
+    }
   }
   
   # Ensure hMailServer service is running
@@ -425,7 +561,7 @@ declare(strict_types=1);
 
 return [
     'hmailserver_admin_password' => '$($Config.HmailAdminPass)',
-    'api_key' => '',
+    'api_key' => '$($Config.ApiKey)',
     'allowed_domains' => [],
     'rate_limit' => 0,
     'debug' => false,
@@ -433,7 +569,7 @@ return [
     'log_file' => __DIR__ . '/logs/api.log',
 ];
 "@
-  Set-Content -Path (Join-Path $Config.ApiDir "config.php") -Value $apiConfig -Encoding UTF8
+  Write-TextFileUtf8NoBom (Join-Path $Config.ApiDir "config.php") $apiConfig
   
   Write-Host "Mail API deployed to: $($Config.ApiDir)"
 
@@ -520,7 +656,7 @@ return [
     'log_file' => __DIR__ . '/logs/admin.log',
 ];
 "@
-  Set-Content -Path (Join-Path $Config.AdminDir "config.php") -Value $adminConfigPhp -Encoding UTF8
+  Write-TextFileUtf8NoBom (Join-Path $Config.AdminDir "config.php") $adminConfigPhp
   
   Write-Host "Admin Panel deployed to: $($Config.AdminDir)"
   
@@ -550,6 +686,7 @@ return [
   Write-Host "  - Configure DNS MX records for your domain"
   Write-Host ""
   Write-Host "API Usage (JSON):"
-  Write-Host '  curl -X POST http://<IP>/api/v1/accounts -H "Content-Type: application/json" -d "{\"email\":\"user@example.com\",\"password\":\"pass123\"}"'
+  Write-Host "  X-API-Key: $($Config.ApiKey)"
+  Write-Host '  curl -X POST http://<IP>/api/v1/accounts -H "Content-Type: application/json" -H "X-API-Key: <API_KEY>" -d "{\"email\":\"user@example.com\",\"password\":\"pass123\"}"'
   Write-Host "=============================================================="
   
