@@ -1,620 +1,648 @@
 <# ===========================================================
-Windows Mail Stack Installer
-- IIS + PHP (FastCGI)
-- MySQL (MSI silent with properties)
+Mail Stack Installer (Windows) — CLEAN / PINNED / VERIFIED
+- IIS + PHP (FastCGI)      (PHP x86 required for COM with hMailServer)
+- MySQL (ZIP install)      (deterministic + hash-verified; avoids MSI property drift)
 - Roundcube (download + config + DB init)
-- hMailServer (silent install)
+- hMailServer (silent install; supports local EXE when official download blocks automation)
+- Deploy /api + /admin from folders next to this script (optional)
 
 Run as Administrator.
 =========================================================== #>
 
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
 # ---------------------------
-# 0) Configuration (modify here only)
+# 0) Configuration (edit here only)
 # ---------------------------
 $Config = @{
-    # Your domain (for documentation; Roundcube login still uses email address)
-    Domain = "dhieihe.work"
-  
-    # Roundcube installed as IIS site root: http://<IP>/
-    WebRoot      = "C:\inetpub\wwwroot"
-    RoundcubeDir = "C:\inetpub\wwwroot"
+  # General
+  Domain            = "dhieihe.work"
+  TimeZone          = "Europe/Berlin"     # used for PHP date.timezone
+  InstallRoot       = "C:\MailStack"      # logs + working area
+  SiteName          = "MailWeb"
+  SitePort          = 80
+  SiteHostHeader    = ""                  # optional; leave empty for IP-based
+  SitePhysicalPath  = "C:\inetpub\mailstack"  # NOT default wwwroot (safer)
 
-    # Roundcube connects to local IMAP/SMTP (provided by hMailServer after installation)
-    ImapHost = "127.0.0.1"
-    SmtpHost = "127.0.0.1"
-  
-    # MySQL
-    # MySQL Community Server MSI (Windows x64)
-    MySqlMsiUrl       = "https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.40-winx64.msi"
-    # Optional: if set, use this local MSI instead of downloading
-    MySqlMsiPath      = ""
-    # Optional: override install/data directories (recommended to keep DATADIR out of Program Files)
-    MySqlInstallDir   = ""  # e.g. "C:\MySQL"
-    MySqlDataDir      = "C:\ProgramData\MySQL\data"
-    MySqlService      = "MySQL"
-    MySqlPort         = 3306
-    MySqlRootPass     = "ChangeMe_Strong_RootPass!"
-    RoundcubeDBName   = "roundcube"
-    RoundcubeDBUser   = "roundcube_user"
-    RoundcubeDBPass   = "ChangeMe_Strong_RC_DBPass!"
-  
-    # Roundcube
-    RoundcubeVersion  = "1.6.12"
-    RoundcubeUrl      = "https://github.com/roundcube/roundcubemail/releases/download/1.6.12/roundcubemail-1.6.12-complete.tar.gz"
-  
-    # PHP (Windows NTS zip; you can also use your own internal mirror/version)
-    # IMPORTANT: hMailServer's COM API is 32-bit only, so PHP must be x86 for COM integration to work.
-    PhpZipUrl = "https://windows.php.net/downloads/releases/php-8.2.30-nts-Win32-vs16-x86.zip"
-    PhpDir    = "C:\PHP"
-  
-    # hMailServer
-    HmailExeUrl = "https://www.hmailserver.com/files/hMailServer-5.6.8-B2574.exe"
-    # Optional: if set, use this local EXE instead of downloading
-    HmailExePath = ""
-    HmailInstallDir = "C:\Program Files (x86)\hMailServer"
-    HmailAdminPass = "ChangeMe_HMailAdmin!"
+  # Roundcube (installed into site root)
+  RoundcubeVersion  = "1.6.12"
+  RoundcubeUrl      = "https://github.com/roundcube/roundcubemail/releases/download/1.6.12/roundcubemail-1.6.12-complete.tar.gz"
+  ImapHost          = "127.0.0.1"
+  SmtpHost          = "127.0.0.1"
 
-    # Mail API (for programmatic account registration)
-    ApiDir = "C:\inetpub\wwwroot\api"
-    ApiKey = ""  # leave empty to auto-generate a strong key
+  # PHP (Pinned + verified)
+  # IMPORTANT: hMailServer COM is 32-bit, so PHP must be x86, and IIS app pool must allow 32-bit apps.
+  PhpDir            = "C:\PHP"
+  PhpZipUrl         = "https://windows.php.net/downloads/releases/php-8.4.16-nts-Win32-vs17-x86.zip"
+  PhpZipSha256      = "75349d9db21e2c7ab4ea734019ed339ebb0ef787d81860599e3120018de3ad84"
 
-    # Admin Panel
-    AdminDir = "C:\inetpub\wwwroot\admin"
-    AdminUsername = "admin"
-    AdminPassword = "ChangeMe_Admin123!"
+  # MySQL (Pinned + verified)
+  MySqlVersion      = "8.4.8"
+  MySqlZipUrl       = "https://dev.mysql.com/get/Downloads/MySQL-8.4/mysql-8.4.8-winx64.zip"
+  MySqlZipMd5       = "0b268cf3d792dad998dca057c386d45c"
+  MySqlBaseDir      = "C:\MySQL\8.4"
+  MySqlDataDir      = "C:\ProgramData\MySQL\data"
+  MySqlLogDir       = "C:\ProgramData\MySQL\log"
+  MySqlService      = "MySQL"
+  MySqlPort         = 3306
+  MySqlRootPass     = "ChangeMe_Strong_RootPass!"
 
-    # Installer behavior
-    # If Windows keeps reporting a pending reboot even after multiple restarts,
-    # set this to $true to continue anyway (NOT recommended; MariaDB MSI may still fail).
-    IgnorePendingReboot = $true
+  # Roundcube DB
+  RoundcubeDBName   = "roundcube"
+  RoundcubeDBUser   = "roundcube_user"
+  RoundcubeDBPass   = "ChangeMe_Strong_RC_DBPass!"
+
+  # hMailServer (silent install)
+  # NOTE: official download may 403 in automated contexts; set HmailExePath to a local EXE to be reliable.
+  HmailExeUrl       = "https://www.hmailserver.com/files/hMailServer-5.6.8-B2574.exe"
+  HmailExePath      = ""  # if provided and exists, used instead of download
+  HmailInstallDir   = "C:\Program Files (x86)\hMailServer"
+  HmailAdminPass    = "ChangeMe_HMailAdmin!"
+
+  # Mail API (optional)
+  ApiDir            = ""  # defaults to "$SitePhysicalPath\api"
+  ApiKey            = ""  # auto-generate if blank
+
+  # Admin Panel (optional)
+  AdminDir          = ""  # defaults to "$SitePhysicalPath\admin"
+  AdminUsername     = "admin"
+  AdminPassword     = "ChangeMe_Admin123!"
+  AdminAppName      = "Mail Server Admin"
+  AdminMaxBulkAccounts = 1000
+  AdminDefaultBulkCount = 10
+  AdminMinPasswordLength = 4
+
+  # Behavior / safety
+  IgnorePendingReboot   = $false
+  AllowDefaultSecrets   = $false   # if false, script stops if passwords contain "ChangeMe"
+  CreateApiAndAdmin     = $true
+  VerifyDownloads       = $true
+}
+
+# ---------------------------
+# 1) Logging + helpers (global, consistent)
+# ---------------------------
+function Write-Log([string]$Message, [ValidateSet("INFO","WARN","ERROR","OK")] [string]$Level = "INFO") {
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  $line = "[$ts][$Level] $Message"
+  Write-Host $line
+  if ($script:LogFile) { Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 }
+}
+
+function Invoke-Step([string]$Name, [scriptblock]$Action) {
+  Write-Log "==> $Name" "INFO"
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    & $Action
+    $sw.Stop()
+    Write-Log "<== $Name (OK) in $([int]$sw.Elapsed.TotalSeconds)s" "OK"
+  } catch {
+    $sw.Stop()
+    Write-Log "<== $Name (FAILED) in $([int]$sw.Elapsed.TotalSeconds)s : $($_.Exception.Message)" "ERROR"
+    throw
   }
-  
-  # ---------------------------
-  # 1) Administrator privilege check
-  # ---------------------------
-  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-  if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "Please run PowerShell as Administrator"
-  }
+}
 
-  # ---------------------------
-  # 1.1) Pending reboot guard
-  #   MSI installs (esp. DB bootstrap) can fail when Windows is pending reboot.
-  # ---------------------------
-  function Get-PendingRebootState {
-    $reasons = New-Object System.Collections.Generic.List[string]
+function Assert-Admin {
+  $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Please run PowerShell as Administrator."
+  }
+}
+
+function Ensure-Directory([string]$Path) {
+  if ([string]::IsNullOrWhiteSpace($Path)) { return }
+  if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Force -Path $Path | Out-Null }
+}
+
+function Get-PendingRebootState {
+  $reasons = New-Object System.Collections.Generic.List[string]
+  try {
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+      $reasons.Add("CBS:RebootPending")
+    }
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+      $reasons.Add("WindowsUpdate:RebootRequired")
+    }
+    $pfr = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    if ($null -ne $pfr -and $pfr.Count -gt 0) {
+      $reasons.Add(("SessionManager:PendingFileRenameOperations({0})" -f $pfr.Count))
+    }
     try {
-      if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
-        $reasons.Add("CBS:RebootPending")
-      }
-      if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
-        $reasons.Add("WindowsUpdate:RebootRequired")
-      }
+      $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+      if ($sysInfo -and $sysInfo.RebootRequired) { $reasons.Add("Microsoft.Update.SystemInfo:RebootRequired") }
+    } catch { }
+  } catch { }
+  [pscustomobject]@{ IsPending = ($reasons.Count -gt 0); Reasons = $reasons.ToArray() }
+}
 
-      $pfr = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue).PendingFileRenameOperations
-      if ($null -ne $pfr -and $pfr.Count -gt 0) {
-        $reasons.Add(("SessionManager:PendingFileRenameOperations({0})" -f $pfr.Count))
-      }
-
-      # COM-based check (often aligns with Windows Update state)
-      try {
-        $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
-        if ($sysInfo -and $sysInfo.RebootRequired) {
-          $reasons.Add("Microsoft.Update.SystemInfo:RebootRequired")
-        }
-      } catch {
-        # Ignore COM errors
-      }
-    } catch {
-      # Ignore and treat as not pending
-    }
-
-    return [pscustomobject]@{
-      IsPending = ($reasons.Count -gt 0)
-      Reasons   = $reasons.ToArray()
-    }
-  }
-
-  function Test-PendingReboot {
-    return (Get-PendingRebootState).IsPending
-  }
-
-  function Show-PendingRebootState([object]$state, [string]$prefix = "  ") {
-    if (-not $state -or -not $state.IsPending) { return }
-    Write-Host "$($prefix)Pending reboot detected:" -ForegroundColor Yellow
-    foreach ($r in $state.Reasons) {
-      Write-Host "$prefix- $r" -ForegroundColor Yellow
-    }
-  }
-
-  $pendingAtStart = Get-PendingRebootState
-  if ($pendingAtStart.IsPending) {
-    Show-PendingRebootState $pendingAtStart
+function Assert-NoPendingReboot {
+  $state = Get-PendingRebootState
+  if ($state.IsPending) {
+    Write-Log "Pending reboot detected: $($state.Reasons -join ', ')" "WARN"
     if (-not $Config.IgnorePendingReboot) {
-      $onlyPfr = ($pendingAtStart.Reasons.Count -eq 1 -and $pendingAtStart.Reasons[0] -like "SessionManager:PendingFileRenameOperations*")
-      if ($onlyPfr) {
-        Write-Host "  NOTE: Only PendingFileRenameOperations is set. This can get 'stuck' even after many reboots (e.g., failed installers/updates)." -ForegroundColor Yellow
-        Write-Host "  To inspect what's pending:" -ForegroundColor Yellow
-        Write-Host "    (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations).PendingFileRenameOperations | Select-Object -First 40" -ForegroundColor Yellow
-        Write-Host "  If you have rebooted multiple times and it still persists, you can clear it (backup first), then reboot:" -ForegroundColor Yellow
-        Write-Host "    reg export `"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager`" `"$PSScriptRoot\session-manager-backup.reg`" /y" -ForegroundColor Yellow
-        Write-Host "    Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue" -ForegroundColor Yellow
-        Write-Host "    Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations2 -ErrorAction SilentlyContinue" -ForegroundColor Yellow
-        Write-Host "    Restart-Computer" -ForegroundColor Yellow
-      }
-      $reasonText = ($pendingAtStart.Reasons -join ", ")
-      throw "A system reboot is pending (detected by: $reasonText). Please reboot Windows first, then re-run this script. If this persists after multiple reboots, set IgnorePendingReboot = `$true in the `$Config block to bypass."
-    } else {
-      Write-Host "  WARNING: IgnorePendingReboot=true; continuing despite pending reboot." -ForegroundColor Yellow
+      throw "A system reboot is pending. Reboot Windows, then re-run. (Set IgnorePendingReboot=\$true to bypass — not recommended.)"
+    }
+    Write-Log "IgnorePendingReboot=true; continuing despite pending reboot." "WARN"
+  }
+}
+
+function Test-LocalTcpPortInUse([int]$Port) {
+  try {
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+      $conn = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
+      return ($null -ne $conn -and $conn.Count -gt 0)
+    }
+  } catch { }
+  try {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    $listener.Start(); $listener.Stop()
+    return $false
+  } catch { return $true }
+}
+
+function Assert-SafeSecrets {
+  if ($Config.AllowDefaultSecrets) { return }
+
+  $checks = @(
+    @{ Name="MySqlRootPass";   Value=$Config.MySqlRootPass },
+    @{ Name="RoundcubeDBPass";Value=$Config.RoundcubeDBPass },
+    @{ Name="HmailAdminPass"; Value=$Config.HmailAdminPass },
+    @{ Name="AdminPassword";  Value=$Config.AdminPassword }
+  )
+
+  foreach ($c in $checks) {
+    if ([string]::IsNullOrWhiteSpace($c.Value)) { throw "Secret '$($c.Name)' is empty. Set it in the Config block." }
+    if ($c.Value -match "ChangeMe") {
+      throw "Secret '$($c.Name)' still contains 'ChangeMe'. Set strong unique values (or set AllowDefaultSecrets=\$true)."
     }
   }
+}
 
-  # Generate a strong API key if not provided (prevents unauthenticated account creation)
+function Initialize-ConfigDerivedPaths {
+  if ([string]::IsNullOrWhiteSpace($Config.ApiDir))   { $Config.ApiDir   = (Join-Path $Config.SitePhysicalPath "api") }
+  if ([string]::IsNullOrWhiteSpace($Config.AdminDir)) { $Config.AdminDir = (Join-Path $Config.SitePhysicalPath "admin") }
   if ([string]::IsNullOrWhiteSpace($Config.ApiKey)) {
     $Config.ApiKey = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
   }
-  
-  # ---------------------------
-  # Force TLS 1.2 for HTTPS downloads (required for modern servers)
-  # ---------------------------
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+}
 
-  # ---------------------------
-  # Utility function: Download
-  # ---------------------------
-  function Download-File($Url, $OutFile) {
-    Write-Host "Downloading: $Url"
-    $lastError = $null
+# Force TLS 1.2+ for downloads
+[Net.ServicePointManager]::SecurityProtocol = `
+  [Net.SecurityProtocolType]::Tls12 -bor `
+  [Net.SecurityProtocolType]::Tls11 -bor `
+  [Net.SecurityProtocolType]::Tls
 
-    # Prefer HTTPS, but some Windows environments can't establish TLS to certain hosts.
-    # As a last resort, retry over HTTP (insecure) for known hosts with TLS issues.
-    $urlsToTry = @($Url)
-    if ($Url -match '^https://(downloads\.mariadb\.org|dev\.mysql\.com)/') {
-      $httpUrl = $Url -replace '^https://', 'http://'
-      if ($httpUrl -ne $Url) {
-        $urlsToTry += $httpUrl
+function Download-File([string]$Url, [string]$OutFile) {
+  Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+  Write-Log "Downloading: $Url -> $OutFile" "INFO"
+
+  $lastError = $null
+
+  # 1) Invoke-WebRequest
+  try {
+    $iwrParams = @{ Uri=$Url; OutFile=$OutFile; ErrorAction='Stop' }
+    if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey('UseBasicParsing')) { $iwrParams.UseBasicParsing = $true }
+    Invoke-WebRequest @iwrParams
+  } catch { $lastError = $_ }
+
+  if (-not (Test-Path $OutFile)) {
+    # 2) BITS
+    try {
+      if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+        Write-Log "Invoke-WebRequest failed; trying BITS..." "WARN"
+        Start-BitsTransfer -Source $Url -Destination $OutFile -ErrorAction Stop
       }
-    }
+    } catch { $lastError = $_ }
+  }
 
-    foreach ($u in $urlsToTry) {
-      if ($u -ne $Url) {
-        Write-Host "  WARNING: HTTPS download failed; retrying over HTTP (insecure): $u" -ForegroundColor Yellow
-      }
-
-      Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
-
-      # 1) Invoke-WebRequest
-      try {
-        $iwrParams = @{
-          Uri         = $u
-          OutFile     = $OutFile
-          ErrorAction = 'Stop'
-        }
-        # -UseBasicParsing is removed in PowerShell 6+
-        if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey('UseBasicParsing')) {
-          $iwrParams.UseBasicParsing = $true
-        }
-        Invoke-WebRequest @iwrParams
-      } catch {
-        $lastError = $_
-      }
-      if (Test-Path $OutFile) { return }
-
-      # 2) BITS (often works when .NET TLS fails / proxy environments)
-      try {
-        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
-          Write-Host "Invoke-WebRequest failed, trying BITS..." -ForegroundColor Yellow
-          Start-BitsTransfer -Source $u -Destination $OutFile -ErrorAction Stop
-        }
-      } catch {
-        $lastError = $_
-      }
-      if (Test-Path $OutFile) { return }
-
-      # 3) WebClient
-      try {
-        Write-Host "BITS failed, trying WebClient..." -ForegroundColor Yellow
-        $webClient = New-Object System.Net.WebClient
-        $webClient.DownloadFile($u, $OutFile)
-      } catch {
-        $lastError = $_
-      }
-      if (Test-Path $OutFile) { return }
-    }
-
-    $msg = "Download failed: $OutFile"
-    if ($lastError) { $msg += "`nLast error: $($lastError.Exception.Message)" }
+  if (-not (Test-Path $OutFile)) {
+    $msg = "Download failed: $Url"
+    if ($lastError) { $msg += " | Last error: $($lastError.Exception.Message)" }
     throw $msg
   }
+}
 
-  # Utility function: Write UTF-8 without BOM (prevents PHP "headers already sent" issues)
-  function Write-TextFileUtf8NoBom([string]$Path, [string]$Content) {
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
-  }
+function Get-FileHashHex([string]$Path, [ValidateSet("MD5","SHA256")] [string]$Algorithm) {
+  (Get-FileHash -Path $Path -Algorithm $Algorithm).Hash.ToLowerInvariant()
+}
 
-  # Utility function: Extract .tar.gz (works on Windows without built-in tar)
-  function Extract-TarGz($TarGzPath, $DestDir) {
-    Add-Type -AssemblyName System.IO.Compression
-    
-    # Step 1: Decompress .gz to .tar
-    $tarPath = $TarGzPath -replace '\.gz$', ''
-    $gzStream = [System.IO.File]::OpenRead($TarGzPath)
-    $gzipStream = New-Object System.IO.Compression.GZipStream($gzStream, [System.IO.Compression.CompressionMode]::Decompress)
-    $tarStream = [System.IO.File]::Create($tarPath)
-    $gzipStream.CopyTo($tarStream)
-    $tarStream.Close()
-    $gzipStream.Close()
-    $gzStream.Close()
-    
-    # Step 2: Extract .tar (simple TAR parser for POSIX/ustar format)
-    $tarBytes = [System.IO.File]::ReadAllBytes($tarPath)
-    $pos = 0
-    while ($pos -lt $tarBytes.Length - 512) {
-      # Read 512-byte header
-      $header = $tarBytes[$pos..($pos + 511)]
-      $pos += 512
-      
-      # Check for empty block (end of archive)
-      $allZero = $true
-      for ($i = 0; $i -lt 100; $i++) { if ($header[$i] -ne 0) { $allZero = $false; break } }
-      if ($allZero) { break }
-      
-      # Extract filename (bytes 0-99)
-      $nameBytes = $header[0..99]
-      $nameEnd = [Array]::IndexOf($nameBytes, [byte]0)
-      if ($nameEnd -lt 0) { $nameEnd = 100 }
-      $name = [System.Text.Encoding]::UTF8.GetString($nameBytes, 0, $nameEnd)
-      
-      # Check for prefix (bytes 345-499) for long paths
-      $prefixBytes = $header[345..499]
-      $prefixEnd = [Array]::IndexOf($prefixBytes, [byte]0)
-      if ($prefixEnd -lt 0) { $prefixEnd = 155 }
-      $prefix = [System.Text.Encoding]::UTF8.GetString($prefixBytes, 0, $prefixEnd)
-      if ($prefix) { $name = "$prefix/$name" }
-      
-      # Extract size (bytes 124-135, octal)
-      $sizeStr = [System.Text.Encoding]::ASCII.GetString($header[124..135]).Trim([char]0, ' ')
-      $size = 0
-      if ($sizeStr) { $size = [Convert]::ToInt64($sizeStr, 8) }
-      
-      # Extract type (byte 156): '0' or null = file, '5' = directory
-      $type = [char]$header[156]
-      
-      # Build full path
-      $fullPath = Join-Path $DestDir $name.TrimStart('/')
-      
-      if ($type -eq '5' -or $name.EndsWith('/')) {
-        # Directory
-        New-Item -ItemType Directory -Force -Path $fullPath -ErrorAction SilentlyContinue | Out-Null
-      }
-      elseif ($type -eq '0' -or $type -eq [char]0) {
-        # Regular file
-        $parentDir = Split-Path $fullPath -Parent
-        if ($parentDir -and -not (Test-Path $parentDir)) {
-          New-Item -ItemType Directory -Force -Path $parentDir | Out-Null
-        }
-        if ($size -gt 0) {
-          $fileBytes = $tarBytes[$pos..($pos + $size - 1)]
-          [System.IO.File]::WriteAllBytes($fullPath, $fileBytes)
-        } else {
-          [System.IO.File]::WriteAllBytes($fullPath, @())
-        }
-      }
-      
-      # Move to next header (size rounded up to 512-byte block)
-      $blocks = [Math]::Ceiling($size / 512)
-      $pos += $blocks * 512
-    }
-    
-    # Cleanup temp .tar file
-    Remove-Item $tarPath -Force -ErrorAction SilentlyContinue
+function Assert-Hash([string]$Path, [string]$ExpectedHex, [ValidateSet("MD5","SHA256")] [string]$Algorithm) {
+  if (-not $Config.VerifyDownloads) { return }
+  $actual = Get-FileHashHex $Path $Algorithm
+  if ($actual -ne $ExpectedHex.ToLowerInvariant()) {
+    throw "Hash mismatch for $Path ($Algorithm). Expected=$ExpectedHex Actual=$actual"
   }
-  
-  # Utility function: Find mysql.exe under Program Files
-  function Find-MySqlExe {
-    $candidates = @(
-      "C:\Program Files\MySQL\MySQL Server*\bin\mysql.exe",
-      "C:\Program Files (x86)\MySQL\MySQL Server*\bin\mysql.exe",
-      "C:\MySQL*\bin\mysql.exe"
-    )
-    foreach ($pat in $candidates) {
-      $hit = Get-ChildItem -Path $pat -ErrorAction SilentlyContinue | Select-Object -First 1
-      if ($hit) { return $hit.FullName }
-    }
-    return $null
+  Write-Log "Verified $Algorithm hash for $(Split-Path $Path -Leaf)" "OK"
+}
+
+function Write-TextFileUtf8NoBom([string]$Path, [string]$Content) {
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, $Content, $enc)
+}
+
+function Extract-TarGz([string]$TarGzPath, [string]$DestDir) {
+  # Prefer built-in tar if available (newer Windows)
+  $tar = Get-Command tar -ErrorAction SilentlyContinue
+  if ($tar) {
+    Ensure-Directory $DestDir
+    & $tar.Source -xzf $TarGzPath -C $DestDir
+    if ($LASTEXITCODE -ne 0) { throw "tar extraction failed (exit=$LASTEXITCODE)" }
+    return
   }
 
-  # Utility function: Check if a TCP port is already in use
-  function Test-LocalTcpPortInUse([int]$Port) {
-    try {
-      if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
-        $conn = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
-        return ($null -ne $conn -and $conn.Count -gt 0)
-      }
-    } catch {
-      # Fall back below
-    }
+  # Fallback TAR.GZ extractor (memory-heavy but compatible)
+  Add-Type -AssemblyName System.IO.Compression
+  $tarPath = $TarGzPath -replace '\.gz$', ''
+  $gzStream = [System.IO.File]::OpenRead($TarGzPath)
+  $gzipStream = New-Object System.IO.Compression.GZipStream($gzStream, [System.IO.Compression.CompressionMode]::Decompress)
+  $tarStream = [System.IO.File]::Create($tarPath)
+  $gzipStream.CopyTo($tarStream)
+  $tarStream.Close(); $gzipStream.Close(); $gzStream.Close()
 
-    try {
-      $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
-      $listener.Start()
-      $listener.Stop()
-      return $false
-    } catch {
-      return $true
-    }
-  }
-  
-  # ---------------------------
-  # 2) Install IIS (including FastCGI)
-  # ---------------------------
-  Write-Host "Installing IIS..."
-  $iisResult = Install-WindowsFeature Web-Server, Web-Common-Http, Web-Default-Doc, Web-Static-Content, `
-    Web-Http-Errors, Web-Http-Redirect, Web-Http-Logging, Web-Request-Monitor, `
-    Web-Filtering, Web-App-Dev, Web-CGI, Web-Mgmt-Tools
+  $tarBytes = [System.IO.File]::ReadAllBytes($tarPath)
+  $pos = 0
+  while ($pos -lt $tarBytes.Length - 512) {
+    $header = $tarBytes[$pos..($pos + 511)]
+    $pos += 512
 
-  if ($iisResult -and ($iisResult.RestartNeeded -eq "Yes")) {
-    Write-Host "  Windows feature installation requires a reboot." -ForegroundColor Yellow
-    Write-Host "  Please reboot, then re-run: powershell -ExecutionPolicy Bypass -File .\Install-MailStack-Windows.ps1" -ForegroundColor Yellow
-    exit 3010
-  }
+    $allZero = $true
+    for ($i=0; $i -lt 100; $i++) { if ($header[$i] -ne 0) { $allZero = $false; break } }
+    if ($allZero) { break }
 
-  $pendingAfterFeatures = Get-PendingRebootState
-  if ($pendingAfterFeatures.IsPending) {
-    Show-PendingRebootState $pendingAfterFeatures
-    if (-not $Config.IgnorePendingReboot) {
-      Write-Host "  A reboot is pending after installing Windows features." -ForegroundColor Yellow
-      Write-Host "  Please reboot, then re-run: powershell -ExecutionPolicy Bypass -File .\Install-MailStack-Windows.ps1" -ForegroundColor Yellow
-      exit 3010
-    } else {
-      Write-Host "  WARNING: IgnorePendingReboot=true; continuing despite pending reboot after Windows features." -ForegroundColor Yellow
-    }
-  }
-  
-  # ---------------------------
-  # 3) Install PHP (zip) and configure FastCGI
-  # ---------------------------
-  Write-Host "Installing PHP..."
-  New-Item -ItemType Directory -Force -Path $Config.PhpDir | Out-Null
-  $phpZip = Join-Path $env:TEMP "php.zip"
-  Download-File $Config.PhpZipUrl $phpZip
-  Expand-Archive -Path $phpZip -DestinationPath $Config.PhpDir -Force
-  
-  $phpIniProd = Join-Path $Config.PhpDir "php.ini-production"
-  $phpIni     = Join-Path $Config.PhpDir "php.ini"
-  Copy-Item $phpIniProd $phpIni -Force
-  
-  # Common extensions for Roundcube + COM for hMailServer API
-  Add-Content -Path $phpIni -Value "`r`nextension_dir=`"$($Config.PhpDir)\ext`"" -Encoding ASCII
-  foreach ($ext in @("mbstring","intl","gd","curl","mysqli","pdo_mysql","zip","fileinfo","exif","openssl","sockets","com_dotnet")) {
-    Add-Content -Path $phpIni -Value "extension=$ext" -Encoding ASCII
-  }
-  Add-Content -Path $phpIni -Value "date.timezone=Asia/Shanghai" -Encoding ASCII
-  Add-Content -Path $phpIni -Value "com.allow_dcom = true" -Encoding ASCII
-  Add-Content -Path $phpIni -Value "com.autoregister_typelib = true" -Encoding ASCII
-  
-  Import-Module WebAdministration
-  $phpCgi = Join-Path $Config.PhpDir "php-cgi.exe"
-  
-  # Register FastCGI application
-  if (-not (Get-WebConfiguration "//system.webServer/fastCgi/application[@fullPath='$phpCgi']" -ErrorAction SilentlyContinue)) {
-    Add-WebConfiguration -Filter "system.webServer/fastCgi" -PSPath "IIS:\" -Value @{fullPath=$phpCgi; arguments="";}
-  }
-  
-  # Map .php to FastCGI
-  New-WebHandler -Name "PHP_via_FastCGI" -Path "*.php" -Verb "*" -Modules "FastCgiModule" `
-    -ScriptProcessor $phpCgi -ResourceType "Either" -ErrorAction SilentlyContinue | Out-Null
+    $nameBytes = $header[0..99]
+    $nameEnd = [Array]::IndexOf($nameBytes, [byte]0)
+    if ($nameEnd -lt 0) { $nameEnd = 100 }
+    $name = [System.Text.Encoding]::UTF8.GetString($nameBytes, 0, $nameEnd)
 
-  # Ensure index.php is a default document (so http://<IP>/ loads Roundcube)
-  try {
-    $indexDocFilter = "system.webServer/defaultDocument/files/add[@value='index.php']"
-    $existingIndexDoc = Get-WebConfigurationProperty -PSPath "IIS:\" -Filter $indexDocFilter -Name "value" -ErrorAction SilentlyContinue
-    if (-not $existingIndexDoc) {
-      Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/defaultDocument/files" -Name "." -Value @{value="index.php"} -ErrorAction Stop | Out-Null
-    }
-  } catch {
-    # Ignore if already present/locked by policy
-  }
+    $prefixBytes = $header[345..499]
+    $prefixEnd = [Array]::IndexOf($prefixBytes, [byte]0)
+    if ($prefixEnd -lt 0) { $prefixEnd = 155 }
+    $prefix = [System.Text.Encoding]::UTF8.GetString($prefixBytes, 0, $prefixEnd)
+    if ($prefix) { $name = "$prefix/$name" }
 
-  # Roundcube Elastic skin fonts (IIS may not include these MIME types by default)
-  function Ensure-IisMimeMap([string]$fileExtension, [string]$mimeType) {
-    try {
-      $filter = "system.webServer/staticContent/mimeMap[@fileExtension='$fileExtension']"
-      $existing = Get-WebConfigurationProperty -PSPath "IIS:\" -Filter $filter -Name "mimeType" -ErrorAction SilentlyContinue
-      if (-not $existing) {
-        Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/staticContent" -Name "." -Value @{fileExtension=$fileExtension; mimeType=$mimeType} -ErrorAction Stop | Out-Null
+    $sizeStr = [System.Text.Encoding]::ASCII.GetString($header[124..135]).Trim([char]0,' ')
+    $size = 0
+    if ($sizeStr) { $size = [Convert]::ToInt64($sizeStr, 8) }
+
+    $type = [char]$header[156]
+    $fullPath = Join-Path $DestDir $name.TrimStart('/')
+
+    if ($type -eq '5' -or $name.EndsWith('/')) {
+      Ensure-Directory $fullPath
+    } elseif ($type -eq '0' -or $type -eq [char]0) {
+      Ensure-Directory (Split-Path $fullPath -Parent)
+      if ($size -gt 0) {
+        [System.IO.File]::WriteAllBytes($fullPath, $tarBytes[$pos..($pos + $size - 1)])
       } else {
-        $current = [string]$existing
-        if ($current -ne $mimeType) {
-          Set-WebConfigurationProperty -PSPath "IIS:\" -Filter $filter -Name "mimeType" -Value $mimeType -ErrorAction SilentlyContinue | Out-Null
-        }
+        [System.IO.File]::WriteAllBytes($fullPath, @())
       }
-    } catch {
-      # Duplicate entries can exist (e.g., already configured); ignore.
     }
+
+    $blocks = [Math]::Ceiling($size / 512)
+    $pos += $blocks * 512
   }
 
-  Ensure-IisMimeMap ".woff"  "application/font-woff"
-  Ensure-IisMimeMap ".woff2" "application/font-woff2"
-  
-  iisreset | Out-Null
-  
-  # ---------------------------
-  # 4) Install MySQL (MSI silent + properties)
-  #   - PASSWORD / SERVICENAME / PORT etc. are officially supported MSI properties
-  # ---------------------------
-  Write-Host "Installing MySQL..."
-  $pendingBeforeMySql = Get-PendingRebootState
-  if ($pendingBeforeMySql.IsPending) {
-    Show-PendingRebootState $pendingBeforeMySql
-    if (-not $Config.IgnorePendingReboot) {
-      $reasonText = ($pendingBeforeMySql.Reasons -join ", ")
-      throw "A system reboot is pending (detected by: $reasonText). Please reboot Windows before installing MySQL, then re-run this script. If this persists after multiple reboots, set IgnorePendingReboot = `$true in the `$Config block to bypass."
+  Remove-Item $tarPath -Force -ErrorAction SilentlyContinue
+}
+
+function Ensure-IisMimeMap([string]$fileExtension, [string]$mimeType) {
+  Import-Module WebAdministration -ErrorAction Stop
+  try {
+    $filter = "system.webServer/staticContent/mimeMap[@fileExtension='$fileExtension']"
+    $existing = Get-WebConfigurationProperty -PSPath "IIS:\" -Filter $filter -Name "mimeType" -ErrorAction SilentlyContinue
+    if (-not $existing) {
+      Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/staticContent" -Name "." -Value @{fileExtension=$fileExtension; mimeType=$mimeType} -ErrorAction Stop | Out-Null
     } else {
-      Write-Host "  WARNING: IgnorePendingReboot=true; continuing MySQL install despite pending reboot." -ForegroundColor Yellow
+      if ([string]$existing -ne $mimeType) {
+        Set-WebConfigurationProperty -PSPath "IIS:\" -Filter $filter -Name "mimeType" -Value $mimeType -ErrorAction SilentlyContinue | Out-Null
+      }
     }
+  } catch { }
+}
+
+function Find-MySqlExe {
+  $candidates = @(
+    (Join-Path $Config.MySqlBaseDir "bin\mysql.exe"),
+    "C:\Program Files\MySQL\MySQL Server*\bin\mysql.exe",
+    "C:\Program Files (x86)\MySQL\MySQL Server*\bin\mysql.exe"
+  )
+  foreach ($pat in $candidates) {
+    $hit = Get-ChildItem -Path $pat -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($hit) { return $hit.FullName }
   }
-  $existingMysql = Find-MySqlExe
-  if ($existingMysql) {
-    Write-Host "  MySQL appears to be already installed (found mysql.exe). Skipping MSI install." -ForegroundColor Yellow
-  } else {
-  function Get-UrlLeafFileName([string]$url, [string]$fallback) {
+  $null
+}
+
+function Find-MySqlD {
+  $d = Join-Path $Config.MySqlBaseDir "bin\mysqld.exe"
+  if (Test-Path $d) { return $d }
+  $null
+}
+
+# ---------------------------
+# 2) Start / preflight
+# ---------------------------
+Assert-Admin
+Initialize-ConfigDerivedPaths
+
+Ensure-Directory $Config.InstallRoot
+$script:LogFile = Join-Path $Config.InstallRoot ("install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+Start-Transcript -Path (Join-Path $Config.InstallRoot ("transcript-{0}.txt" -f (Get-Date -Format "yyyyMMdd-HHmmss"))) | Out-Null
+
+try {
+  Invoke-Step "Preflight checks" {
+    Assert-NoPendingReboot
+    Assert-SafeSecrets
+
+    if (Test-LocalTcpPortInUse $Config.SitePort) {
+      throw "SitePort $($Config.SitePort) is already in use. Change SitePort or stop the conflicting service."
+    }
+    if (Test-LocalTcpPortInUse $Config.MySqlPort) {
+      Write-Log "MySQL port $($Config.MySqlPort) is already in use. If a MySQL instance exists, keep it; otherwise change MySqlPort." "WARN"
+    }
+
+    Write-Log "InstallRoot: $($Config.InstallRoot)" "INFO"
+    Write-Log "Site: $($Config.SiteName) Port=$($Config.SitePort) Path=$($Config.SitePhysicalPath)" "INFO"
+    Write-Log "MySQL: $($Config.MySqlVersion) BaseDir=$($Config.MySqlBaseDir) DataDir=$($Config.MySqlDataDir) Port=$($Config.MySqlPort)" "INFO"
+    Write-Log "PHP: $($Config.PhpDir) (x86 NTS)" "INFO"
+    Write-Log "Roundcube: $($Config.RoundcubeVersion)" "INFO"
+  }
+
+  # ---------------------------
+  # 3) Install IIS + CGI/FastCGI
+  # ---------------------------
+  Invoke-Step "Install IIS + CGI (FastCGI)" {
+    $hasInstallWindowsFeature = (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue)
+    if ($hasInstallWindowsFeature) {
+      $features = @(
+        "Web-Server","Web-Common-Http","Web-Default-Doc","Web-Static-Content",
+        "Web-Http-Errors","Web-Http-Redirect","Web-Http-Logging","Web-Request-Monitor",
+        "Web-Filtering","Web-App-Dev","Web-CGI","Web-Mgmt-Tools"
+      )
+      $res = Install-WindowsFeature @features
+      if ($res.RestartNeeded -eq "Yes") { throw "Windows feature install requires reboot. Reboot and re-run." }
+    } else {
+      # Windows client
+      $features = @(
+        "IIS-WebServerRole","IIS-WebServer","IIS-CommonHttpFeatures","IIS-DefaultDocument",
+        "IIS-StaticContent","IIS-HttpErrors","IIS-HttpRedirect","IIS-HttpLogging",
+        "IIS-RequestMonitor","IIS-Filtering","IIS-ApplicationDevelopment","IIS-CGI",
+        "IIS-ManagementConsole"
+      )
+      foreach ($f in $features) {
+        Enable-WindowsOptionalFeature -Online -FeatureName $f -All -NoRestart -ErrorAction Stop | Out-Null
+      }
+    }
+
+    Assert-NoPendingReboot
+  }
+
+  # ---------------------------
+  # 4) Install PHP (Pinned + SHA256 verified) + FastCGI
+  # ---------------------------
+  Invoke-Step "Install PHP + configure FastCGI" {
+    Ensure-Directory $Config.PhpDir
+
+    $phpZip = Join-Path $env:TEMP ("php-{0}.zip" -f (Get-Date -Format "yyyyMMddHHmmss"))
+    Download-File $Config.PhpZipUrl $phpZip
+    Assert-Hash $phpZip $Config.PhpZipSha256 "SHA256"
+
+    # Clean PHP dir for idempotency
+    Get-ChildItem -Path $Config.PhpDir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+    Expand-Archive -Path $phpZip -DestinationPath $Config.PhpDir -Force
+    Remove-Item $phpZip -Force -ErrorAction SilentlyContinue
+
+    $phpIniProd = Join-Path $Config.PhpDir "php.ini-production"
+    $phpIni     = Join-Path $Config.PhpDir "php.ini"
+    Copy-Item $phpIniProd $phpIni -Force
+
+    # Minimal, common, Roundcube-compatible extensions (+ COM for hMailServer API)
+    $iniLines = @(
+      "extension_dir=""$($Config.PhpDir)\ext""",
+      "date.timezone=$($Config.TimeZone)",
+      "cgi.fix_pathinfo=0",
+      "fastcgi.impersonate=1",
+      "fastcgi.logging=0",
+      "expose_php=0",
+      "memory_limit=256M",
+      "upload_max_filesize=25M",
+      "post_max_size=25M",
+      "max_execution_time=180",
+      "",
+      "extension=mbstring",
+      "extension=intl",
+      "extension=gd",
+      "extension=curl",
+      "extension=mysqli",
+      "extension=pdo_mysql",
+      "extension=zip",
+      "extension=fileinfo",
+      "extension=openssl",
+      "extension=sockets",
+      "extension=com_dotnet",
+      "",
+      "com.allow_dcom=true",
+      "com.autoregister_typelib=true"
+    )
+    Add-Content -Path $phpIni -Value ($iniLines -join "`r`n") -Encoding ASCII
+
+    Import-Module WebAdministration -ErrorAction Stop
+
+    $phpCgi = Join-Path $Config.PhpDir "php-cgi.exe"
+    if (-not (Test-Path $phpCgi)) { throw "php-cgi.exe not found at $phpCgi" }
+
+    # Register FastCGI app (global)
+    $existingFastCgi = Get-WebConfiguration "//system.webServer/fastCgi/application[@fullPath='$phpCgi']" -ErrorAction SilentlyContinue
+    if (-not $existingFastCgi) {
+      Add-WebConfiguration -Filter "system.webServer/fastCgi" -PSPath "IIS:\" -Value @{ fullPath=$phpCgi; arguments=""; } | Out-Null
+    }
+
+    # Handler mapping (global; safe + common)
+    New-WebHandler -Name "PHP_via_FastCGI" -Path "*.php" -Verb "*" -Modules "FastCgiModule" `
+      -ScriptProcessor $phpCgi -ResourceType "Either" -ErrorAction SilentlyContinue | Out-Null
+
+    # Default docs include index.php
     try {
-      $u = [System.Uri]$url
-      $leaf = [System.IO.Path]::GetFileName($u.AbsolutePath)
-      if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
-    } catch {
-      # ignore
-    }
-    return $fallback
-  }
-
-  $mysqlMsiName = Get-UrlLeafFileName $Config.MySqlMsiUrl "mysql-winx64.msi"
-  $mysqlMsi = $null
-
-  if (-not [string]::IsNullOrWhiteSpace($Config.MySqlMsiPath) -and (Test-Path $Config.MySqlMsiPath)) {
-    $mysqlMsi = $Config.MySqlMsiPath
-    Write-Host "  Using local MySQL MSI: $mysqlMsi"
-  } else {
-    $localMsi = Join-Path $PSScriptRoot $mysqlMsiName
-    if (Test-Path $localMsi) {
-      $mysqlMsi = $localMsi
-      Write-Host "  Using MySQL MSI next to script: $mysqlMsi"
-    } else {
-      $mysqlMsi = Join-Path $env:TEMP $mysqlMsiName
-      Download-File $Config.MySqlMsiUrl $mysqlMsi
-    }
-  }
-  
-  # If the requested port is already in use, pick the next available port.
-  if (Test-LocalTcpPortInUse ([int]$Config.MySqlPort)) {
-    $originalPort = [int]$Config.MySqlPort
-    Write-Host "  WARNING: MySQL port $originalPort is already in use. Selecting a free port..." -ForegroundColor Yellow
-    $picked = $false
-    for ($p = $originalPort + 1; $p -le ($originalPort + 50); $p++) {
-      if (-not (Test-LocalTcpPortInUse $p)) {
-        $Config.MySqlPort = $p
-        $picked = $true
-        break
+      $filter = "system.webServer/defaultDocument/files"
+      $hasIndexPhp = Get-WebConfigurationProperty -PSPath "IIS:\" -Filter "$filter/add[@value='index.php']" -Name "value" -ErrorAction SilentlyContinue
+      if (-not $hasIndexPhp) {
+        Add-WebConfigurationProperty -PSPath "IIS:\" -Filter $filter -Name "." -Value @{value="index.php"} | Out-Null
       }
+    } catch { }
+
+    # Modern MIME types for Roundcube fonts
+    Ensure-IisMimeMap ".woff"  "font/woff"
+    Ensure-IisMimeMap ".woff2" "font/woff2"
+  }
+
+  # ---------------------------
+  # 5) Create IIS site + app pool (32-bit ON)
+  # ---------------------------
+  Invoke-Step "Create IIS site + 32-bit app pool" {
+    Import-Module WebAdministration -ErrorAction Stop
+
+    Ensure-Directory $Config.SitePhysicalPath
+
+    $poolName = "$($Config.SiteName)_Pool"
+    if (-not (Test-Path "IIS:\AppPools\$poolName")) {
+      New-WebAppPool -Name $poolName | Out-Null
     }
-    if ($picked) {
-      Write-Host "  Using MySQL port: $($Config.MySqlPort)" -ForegroundColor Yellow
+    # PHP is unmanaged; use "No Managed Code"
+    Set-ItemProperty "IIS:\AppPools\$poolName" -Name "managedRuntimeVersion" -Value "" | Out-Null
+    Set-ItemProperty "IIS:\AppPools\$poolName" -Name "enable32BitAppOnWin64" -Value $true | Out-Null
+
+    if (-not (Test-Path "IIS:\Sites\$($Config.SiteName)")) {
+      if ([string]::IsNullOrWhiteSpace($Config.SiteHostHeader)) {
+        New-Website -Name $Config.SiteName -Port $Config.SitePort -PhysicalPath $Config.SitePhysicalPath -ApplicationPool $poolName | Out-Null
+      } else {
+        New-Website -Name $Config.SiteName -Port $Config.SitePort -HostHeader $Config.SiteHostHeader -PhysicalPath $Config.SitePhysicalPath -ApplicationPool $poolName | Out-Null
+      }
     } else {
-      throw "MySQL port $originalPort is in use and no free port was found nearby. Please stop the conflicting service or set MySqlPort."
+      # keep binding, but enforce physical path + pool
+      Set-ItemProperty "IIS:\Sites\$($Config.SiteName)" -Name physicalPath -Value $Config.SitePhysicalPath | Out-Null
+      Set-ItemProperty "IIS:\Sites\$($Config.SiteName)" -Name applicationPool -Value $poolName | Out-Null
     }
+
+    Start-WebSite -Name $Config.SiteName | Out-Null
   }
 
-  $mysqlLog = Join-Path $env:TEMP ("mysql-install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-  Write-Host "  MySQL MSI log: $mysqlLog"
-
-  function Normalize-WindowsDir([string]$path) {
-    if ([string]::IsNullOrWhiteSpace($path)) { return $path }
-    return $path.TrimEnd('\', '/')
-  }
-
-  function Quote-MsiProperty([string]$name, [string]$value) {
-    $v = Normalize-WindowsDir $value
-    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
-    if ($v -match '\s') {
-      return "$name=`"$v`""
-    }
-    return "$name=$v"
-  }
-
-  # Ensure DATADIR exists (recommended to keep it out of Program Files)
-  if (-not [string]::IsNullOrWhiteSpace($Config.MySqlDataDir)) {
-    New-Item -ItemType Directory -Force -Path $Config.MySqlDataDir | Out-Null
-  }
-
-  # Build argument list as an array to avoid quoting issues
-  # MySQL MSI uses different property names than MariaDB
-  $msiArgs = @("/i", "`"$mysqlMsi`"")
-  $msiArgs += "SERVICENAME=$($Config.MySqlService)"
-  $msiArgs += "MYSQLROOTPASSWORD=$($Config.MySqlRootPass)"
-  $msiArgs += "MYSQLPORT=$($Config.MySqlPort)"
-
-  $installDirProp = Quote-MsiProperty "INSTALLDIR" $Config.MySqlInstallDir
-  if ($installDirProp) { $msiArgs += $installDirProp }
-  $dataDirProp = Quote-MsiProperty "DATADIR" $Config.MySqlDataDir
-  if ($dataDirProp) { $msiArgs += $dataDirProp }
-
-  $msiArgs += @("/qn", "/l*v", "`"$mysqlLog`"")
-
-  $mysqlInstall = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-  if ($mysqlInstall.ExitCode -ne 0) {
-    throw "MySQL installer failed (exit code: $($mysqlInstall.ExitCode)). Please send the log content from: $mysqlLog"
-  }
-  }
-  
-  # Verify MySQL service is installed and running (helps catch silent MSI failures early)
-  $mysqlSvc = Get-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
-  if (-not $mysqlSvc) {
-    Write-Host "  WARNING: MySQL service '$($Config.MySqlService)' was not found after install." -ForegroundColor Yellow
-    Write-Host "  If MySQL is already installed with a different service name, set MySqlService accordingly." -ForegroundColor Yellow
-    Write-Host "  MSI log (if it just ran): $mysqlLog" -ForegroundColor Yellow
-  } else {
-    if ($mysqlSvc.Status -ne "Running") {
-      Write-Host "  Starting MySQL service '$($Config.MySqlService)'..."
-      Start-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
-      Start-Sleep -Seconds 2
-      $mysqlSvc = Get-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
-    }
-    Write-Host "  MySQL service status: $($mysqlSvc.Status)"
-
-    # Wait briefly for the port to become active
-    $waitSeconds = 0
-    while ($waitSeconds -lt 20 -and -not (Test-LocalTcpPortInUse ([int]$Config.MySqlPort))) {
-      Start-Sleep -Seconds 1
-      $waitSeconds++
-    }
-    if (-not (Test-LocalTcpPortInUse ([int]$Config.MySqlPort))) {
-      Write-Host "  WARNING: MySQL port $($Config.MySqlPort) does not appear to be listening yet." -ForegroundColor Yellow
-      Write-Host "  If Roundcube DB init fails, check MySQL error logs under: $($Config.MySqlDataDir)" -ForegroundColor Yellow
-    }
-  }
-
-  Start-Sleep -Seconds 3
-  
   # ---------------------------
-  # 5) Install Roundcube (download + extract + generate config.inc.php)
+  # 6) Install MySQL (ZIP, deterministic)
   # ---------------------------
-  Write-Host "Installing Roundcube..."
-  New-Item -ItemType Directory -Force -Path $Config.RoundcubeDir | Out-Null
-  
-  $rcTgz = Join-Path $env:TEMP "roundcube.tar.gz"
-  Download-File $Config.RoundcubeUrl $rcTgz
-  
-  # Extract .tar.gz (using PowerShell function for compatibility with older Windows)
-  $tmpExtractRoot = Join-Path $env:TEMP "roundcube_extract"
-  Remove-Item $tmpExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Force -Path $tmpExtractRoot | Out-Null
-  
-  Write-Host "Extracting Roundcube (this may take a moment)..."
-  Extract-TarGz $rcTgz $tmpExtractRoot
-  
-  $extracted = Join-Path $tmpExtractRoot "roundcubemail-$($Config.RoundcubeVersion)"
-  if (-not (Test-Path $extracted)) {
-    throw "Roundcube extract directory not found: $extracted (please check if version number matches download package)"
-  }
-  
-  # Deploy to IIS directory (overwrite)
-  Remove-Item $Config.RoundcubeDir -Recurse -Force -ErrorAction SilentlyContinue
-  Copy-Item $extracted $Config.RoundcubeDir -Recurse -Force
+  Invoke-Step "Install MySQL (ZIP) + initialize service" {
+    Ensure-Directory $Config.MySqlBaseDir
+    Ensure-Directory $Config.MySqlDataDir
+    Ensure-Directory $Config.MySqlLogDir
 
-  # Roundcube requires temp/ and logs/ to be writable by the web server user (IIS)
-  foreach ($dirName in @("temp", "logs")) {
-    $dirPath = Join-Path $Config.RoundcubeDir $dirName
-    New-Item -ItemType Directory -Force -Path $dirPath | Out-Null
-    $acl = Get-Acl $dirPath
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
-    $acl.SetAccessRule($rule)
-    Set-Acl $dirPath $acl
+    $mysqlExe = Find-MySqlExe
+    $mysqld   = Find-MySqlD
+
+    if (-not $mysqld -or -not $mysqlExe) {
+      $zip = Join-Path $env:TEMP ("mysql-{0}.zip" -f (Get-Date -Format "yyyyMMddHHmmss"))
+      Download-File $Config.MySqlZipUrl $zip
+      Assert-Hash $zip $Config.MySqlZipMd5 "MD5"
+
+      # Extract into temp then move to BaseDir
+      $tmp = Join-Path $env:TEMP ("mysql_extract_{0}" -f (Get-Date -Format "yyyyMMddHHmmss"))
+      Ensure-Directory $tmp
+      Expand-Archive -Path $zip -DestinationPath $tmp -Force
+      Remove-Item $zip -Force -ErrorAction SilentlyContinue
+
+      $sub = Get-ChildItem -Path $tmp -Directory | Select-Object -First 1
+      if (-not $sub) { throw "MySQL ZIP did not contain a top-level directory as expected." }
+
+      # Clean BaseDir and move extracted
+      Get-ChildItem -Path $Config.MySqlBaseDir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+      Copy-Item -Path $sub.FullName\* -Destination $Config.MySqlBaseDir -Recurse -Force
+      Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $mysqld = Find-MySqlD
+    $mysqlExe = Find-MySqlExe
+    if (-not $mysqld -or -not $mysqlExe) { throw "MySQL binaries not found after extraction." }
+
+    # my.ini (stored in ProgramData to keep it stable)
+    $myIni = Join-Path (Split-Path $Config.MySqlDataDir -Parent) "my.ini"
+    $myIniContent = @"
+[mysqld]
+basedir=$($Config.MySqlBaseDir)
+datadir=$($Config.MySqlDataDir)
+port=$($Config.MySqlPort)
+bind-address=127.0.0.1
+mysqlx=0
+
+character-set-server=utf8mb4
+collation-server=utf8mb4_0900_ai_ci
+skip_name_resolve=1
+
+log_error=$($Config.MySqlLogDir)\mysql-error.log
+
+[client]
+port=$($Config.MySqlPort)
+"@
+    Write-TextFileUtf8NoBom $myIni $myIniContent
+
+    # Install service if missing
+    $svc = Get-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
+    if (-not $svc) {
+      # Initialize datadir if empty
+      $hasData = (Get-ChildItem -Path $Config.MySqlDataDir -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0
+      if (-not $hasData) {
+        & $mysqld --defaults-file="$myIni" --initialize-insecure --console
+        if ($LASTEXITCODE -ne 0) { throw "mysqld --initialize-insecure failed (exit=$LASTEXITCODE)." }
+      }
+
+      & $mysqld --install $Config.MySqlService --defaults-file="$myIni"
+      if ($LASTEXITCODE -ne 0) { throw "mysqld --install failed (exit=$LASTEXITCODE)." }
+    }
+
+    Start-Service -Name $Config.MySqlService -ErrorAction Stop
+    (Get-Service -Name $Config.MySqlService).WaitForStatus("Running",[TimeSpan]::FromSeconds(30)) | Out-Null
+
+    # Wait for port
+    $wait = 0
+    while ($wait -lt 25 -and -not (Test-LocalTcpPortInUse $Config.MySqlPort)) { Start-Sleep 1; $wait++ }
+    if (-not (Test-LocalTcpPortInUse $Config.MySqlPort)) {
+      throw "MySQL service is running, but port $($Config.MySqlPort) is not listening. Check $($Config.MySqlLogDir)\mysql-error.log"
+    }
+
+    # Set root password (only if not set yet) — try connecting without password first
+    $tryNoPass = & $mysqlExe -uroot -h 127.0.0.1 -P $Config.MySqlPort -e "SELECT 1;" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      & $mysqlExe -uroot -h 127.0.0.1 -P $Config.MySqlPort -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$($Config.MySqlRootPass)'; FLUSH PRIVILEGES;"
+      if ($LASTEXITCODE -ne 0) { throw "Failed setting MySQL root password." }
+      Write-Log "MySQL root password set." "OK"
+    } else {
+      Write-Log "MySQL root password appears already set (or root cannot login without password). Continuing." "INFO"
+    }
   }
 
-  # IIS doesn't process Roundcube's .htaccess, so block HTTP access to private folders
-  $denyWebConfig = @"
+  # ---------------------------
+  # 7) Install Roundcube into site root + lock down folders
+  # ---------------------------
+  Invoke-Step "Install Roundcube" {
+    Ensure-Directory $Config.SitePhysicalPath
+
+    $rcTgz = Join-Path $env:TEMP ("roundcube-{0}.tar.gz" -f $Config.RoundcubeVersion)
+    Download-File $Config.RoundcubeUrl $rcTgz
+
+    $tmpExtractRoot = Join-Path $env:TEMP ("roundcube_extract_{0}" -f (Get-Date -Format "yyyyMMddHHmmss"))
+    Remove-Item $tmpExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Ensure-Directory $tmpExtractRoot
+
+    Extract-TarGz $rcTgz $tmpExtractRoot
+    Remove-Item $rcTgz -Force -ErrorAction SilentlyContinue
+
+    $extracted = Join-Path $tmpExtractRoot "roundcubemail-$($Config.RoundcubeVersion)"
+    if (-not (Test-Path $extracted)) { throw "Roundcube extract dir not found: $extracted" }
+
+    # Deploy to site root (clean but do not touch admin/api if they already exist)
+    $keep = @("admin","api")
+    $existingItems = Get-ChildItem -Path $Config.SitePhysicalPath -Force -ErrorAction SilentlyContinue
+    foreach ($it in $existingItems) {
+      if ($keep -contains $it.Name) { continue }
+      Remove-Item $it.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Copy-Item -Path (Join-Path $extracted "*") -Destination $Config.SitePhysicalPath -Recurse -Force
+    Remove-Item $tmpExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Writable dirs for IIS
+    foreach ($d in @("temp","logs")) {
+      $p = Join-Path $Config.SitePhysicalPath $d
+      Ensure-Directory $p
+      $acl = Get-Acl $p
+      $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS","Modify","ContainerInherit,ObjectInherit","None","Allow")
+      $acl.SetAccessRule($rule)
+      Set-Acl $p $acl
+    }
+
+    # Block HTTP access to sensitive dirs (IIS ignores .htaccess)
+    $denyWebConfig = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
   <system.webServer>
@@ -626,357 +654,323 @@ $Config = @{
   </system.webServer>
 </configuration>
 "@
-
-  foreach ($subDir in @("config", "temp", "logs", "SQL")) {
-    $dir = Join-Path $Config.RoundcubeDir $subDir
-    if (Test-Path $dir) {
-      Write-TextFileUtf8NoBom (Join-Path $dir "web.config") $denyWebConfig
+    foreach ($sub in @("config","temp","logs","SQL","installer")) {
+      $dir = Join-Path $Config.SitePhysicalPath $sub
+      if (Test-Path $dir) {
+        Write-TextFileUtf8NoBom (Join-Path $dir "web.config") $denyWebConfig
+      }
     }
-  }
-  
-  # Generate Roundcube config (separate config: DB/IMAP/SMTP all here)
-  $rcConfigDir = Join-Path $Config.RoundcubeDir "config"
-  New-Item -ItemType Directory -Force -Path $rcConfigDir | Out-Null
-  $rcConfig = Join-Path $rcConfigDir "config.inc.php"
-  
-  $desKey = [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
-  
-  $configPhp = @"
+
+    # Remove installer (defense-in-depth)
+    Remove-Item (Join-Path $Config.SitePhysicalPath "installer") -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Generate Roundcube config
+    $rcConfigDir = Join-Path $Config.SitePhysicalPath "config"
+    Ensure-Directory $rcConfigDir
+    $rcConfig = Join-Path $rcConfigDir "config.inc.php"
+
+    $desKey = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
+
+    $configPhp = @"
 <?php
-`$config['db_dsnw'] = 'mysql://$($Config.RoundcubeDBUser):$($Config.RoundcubeDBPass)@localhost:$($Config.MySqlPort)/$($Config.RoundcubeDBName)';
-`$config['default_host'] = '$($Config.ImapHost)';
-`$config['smtp_server']  = '$($Config.SmtpHost)';
-`$config['smtp_user']    = '%u';
-`$config['smtp_pass']    = '%p';
-`$config['product_name'] = 'Webmail';
-`$config['des_key'] = '$desKey';
-`$config['plugins'] = ['archive','zipdownload'];
-`$config['language'] = 'en_US';
-`$config['log_dir']  = __DIR__ . '/../logs';
-`$config['temp_dir'] = __DIR__ . '/../temp';
-`$config['enable_installer'] = false;
+\$config['db_dsnw'] = 'mysql://$($Config.RoundcubeDBUser):$($Config.RoundcubeDBPass)@127.0.0.1:$($Config.MySqlPort)/$($Config.RoundcubeDBName)';
+\$config['default_host'] = '$($Config.ImapHost)';
+\$config['smtp_server']  = '$($Config.SmtpHost)';
+\$config['smtp_user']    = '%u';
+\$config['smtp_pass']    = '%p';
+\$config['product_name'] = 'Webmail';
+\$config['des_key']      = '$desKey';
+\$config['plugins']      = ['archive','zipdownload'];
+\$config['language']     = 'en_US';
+\$config['log_dir']      = __DIR__ . '/../logs';
+\$config['temp_dir']     = __DIR__ . '/../temp';
+\$config['enable_installer'] = false;
 "@
-  Write-TextFileUtf8NoBom $rcConfig $configPhp
+    Write-TextFileUtf8NoBom $rcConfig $configPhp
+  }
 
-  # Defense-in-depth: remove installer directory entirely
-  Remove-Item (Join-Path $Config.RoundcubeDir "installer") -Recurse -Force -ErrorAction SilentlyContinue
-  
   # ---------------------------
-  # 6) Initialize Roundcube database (create DB/user + import schema)
+  # 8) Initialize Roundcube DB (global + deterministic)
   # ---------------------------
-  Write-Host "Initializing Roundcube database..."
+  Invoke-Step "Initialize Roundcube database" {
+    $mysqlExe = Find-MySqlExe
+    if (-not $mysqlExe) { throw "mysql.exe not found." }
 
-  # Ensure MySQL service is running before connecting
-  $mysqlSvc = Get-Service -Name $Config.MySqlService -ErrorAction SilentlyContinue
-  if ($mysqlSvc -and $mysqlSvc.Status -ne "Running") {
-    Write-Host "  Starting MySQL service..."
-    Start-Service -Name $Config.MySqlService -ErrorAction Stop
-    $mysqlSvc.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
-  }
+    function Escape-MySqlString([string]$v) { if ($null -eq $v) { "" } else { $v.Replace('\','\\').Replace("'","''") } }
+    function Quote-MySqlIdentifier([string]$v) { if ($null -eq $v) { "``" } else { ('`' + $v.Replace('`','``') + '`') } }
 
-  $mysqlExe = Find-MySqlExe
-  if (-not $mysqlExe) { throw "mysql.exe not found (MySQL installation may have failed or path differs)" }
-  
-  function Escape-MySqlString([string]$value) {
-    if ($null -eq $value) { return '' }
-    return $value.Replace('\', '\\').Replace("'", "''")
-  }
+    $dbNameQuoted = Quote-MySqlIdentifier $Config.RoundcubeDBName
+    $dbUserEsc = Escape-MySqlString $Config.RoundcubeDBUser
+    $dbPassEsc = Escape-MySqlString $Config.RoundcubeDBPass
 
-  function Quote-MySqlIdentifier([string]$value) {
-    if ($null -eq $value) { return '``' }
-    return ('`' + $value.Replace('`', '``') + '`')
-  }
-
-  $dbName = $Config.RoundcubeDBName
-  $dbNameQuoted = Quote-MySqlIdentifier $dbName
-  $dbUserEsc = Escape-MySqlString $Config.RoundcubeDBUser
-  $dbPassEsc = Escape-MySqlString $Config.RoundcubeDBPass
-
-  # Create DB + user (no temp SQL files; avoids UTF-8 BOM and quoting issues)
-  $bootstrapSql = @"
+    $bootstrapSql = @"
 CREATE DATABASE IF NOT EXISTS $dbNameQuoted DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '$dbUserEsc'@'localhost' IDENTIFIED BY '$dbPassEsc';
 GRANT ALL PRIVILEGES ON $dbNameQuoted.* TO '$dbUserEsc'@'localhost';
 FLUSH PRIVILEGES;
 "@
 
-  $mysqlRootArgs = @(
-    "-uroot",
-    "-p$($Config.MySqlRootPass)",
-    "-h", "127.0.0.1",
-    "-P", "$($Config.MySqlPort)"
-  )
+    $rootArgs = @("-uroot","-p$($Config.MySqlRootPass)","-h","127.0.0.1","-P","$($Config.MySqlPort)","--protocol=TCP")
+    & $mysqlExe @rootArgs -e $bootstrapSql
+    if ($LASTEXITCODE -ne 0) { throw "Roundcube DB bootstrap failed (exit=$LASTEXITCODE)." }
 
-  & $mysqlExe @mysqlRootArgs -e $bootstrapSql
-  if ($LASTEXITCODE -ne 0) { throw "Roundcube DB bootstrap failed (mysql exit code: $LASTEXITCODE)" }
-  
-  # Import Roundcube schema (MySQL/MariaDB)
-  $schema = Join-Path $Config.RoundcubeDir "SQL\mysql.initial.sql"
-  if (-not (Test-Path $schema)) { throw "Roundcube schema not found: $schema" }
+    $schema = Join-Path $Config.SitePhysicalPath "SQL\mysql.initial.sql"
+    if (-not (Test-Path $schema)) { throw "Roundcube schema not found: $schema" }
 
-  $schemaPath = $schema.Replace('\', '/')
-  $sourceStmt = "source `"$schemaPath`""
-  & $mysqlExe @mysqlRootArgs $dbName -e $sourceStmt
-  if ($LASTEXITCODE -ne 0) { throw "Roundcube schema import failed (mysql exit code: $LASTEXITCODE)" }
-  
+    $schemaPath = $schema.Replace('\','/')
+    & $mysqlExe @rootArgs $Config.RoundcubeDBName -e "source `"$schemaPath`""
+    if ($LASTEXITCODE -ne 0) { throw "Roundcube schema import failed (exit=$LASTEXITCODE)." }
+  }
+
   # ---------------------------
-  # 7) Install hMailServer (silent)
-  #   Inno Setup common silent parameters: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+  # 9) Install hMailServer (silent) — supports local EXE
   # ---------------------------
-  $hmailServerExe = Join-Path $Config.HmailInstallDir "Bin\hMailServer.exe"
-  if (Test-Path $hmailServerExe) {
-    Write-Host "hMailServer already installed, skipping..."
-  } else {
-    Write-Host "Installing hMailServer..."
-    $hmailInstallerName = "hMailServer-5.6.8-B2574.exe"
-    $hmailExe = $null
-    
-    if (-not [string]::IsNullOrWhiteSpace($Config.HmailExePath) -and (Test-Path $Config.HmailExePath)) {
-      $hmailExe = $Config.HmailExePath
-      Write-Host "  Using local hMailServer installer: $hmailExe"
-    } else {
-      $localHmail = Join-Path $PSScriptRoot $hmailInstallerName
-      if (Test-Path $localHmail) {
-        $hmailExe = $localHmail
-        Write-Host "  Using hMailServer installer next to script: $hmailExe"
-      } else {
-        $hmailExe = Join-Path $env:TEMP $hmailInstallerName
-        # Download hMailServer installer
-        Download-File $Config.HmailExeUrl $hmailExe
-      }
-    }
-    
-    # Run silent installation
-    Write-Host "  Running hMailServer installer (this may take a few minutes)..."
-    $installProcess = Start-Process $hmailExe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait -PassThru
-    
-    # Check installation result
-    if ($installProcess.ExitCode -ne 0) {
-      Write-Host "  WARNING: hMailServer installer returned exit code: $($installProcess.ExitCode)" -ForegroundColor Yellow
-    }
-    
-    # Verify installation
-    Start-Sleep -Seconds 3
+  Invoke-Step "Install hMailServer (silent)" {
+    $hmailServerExe = Join-Path $Config.HmailInstallDir "Bin\hMailServer.exe"
     if (Test-Path $hmailServerExe) {
-      Write-Host "  hMailServer installed successfully to: $($Config.HmailInstallDir)" -ForegroundColor Green
+      Write-Log "hMailServer already installed. Skipping installer." "INFO"
+      return
+    }
+
+    $installer = $null
+    if (-not [string]::IsNullOrWhiteSpace($Config.HmailExePath) -and (Test-Path $Config.HmailExePath)) {
+      $installer = $Config.HmailExePath
+      Write-Log "Using local hMailServer installer: $installer" "INFO"
     } else {
-      Write-Host "  WARNING: hMailServer installation may have failed. Please check manually." -ForegroundColor Yellow
-      Write-Host "  Expected path: $hmailServerExe" -ForegroundColor Yellow
-    }
-    
-    # Clean up installer (only if we downloaded it to TEMP)
-    if ($hmailExe -like (Join-Path $env:TEMP '*')) {
-      Remove-Item $hmailExe -ErrorAction SilentlyContinue
-    }
-  }
-  
-  # Ensure hMailServer service is running
-  $hmailService = Get-Service -Name "hMailServer" -ErrorAction SilentlyContinue
-  if ($hmailService) {
-    if ($hmailService.Status -ne "Running") {
-      Write-Host "  Starting hMailServer service..."
-      Start-Service -Name "hMailServer" -ErrorAction SilentlyContinue
-    }
-    Write-Host "  hMailServer service status: $($hmailService.Status)"
-  } else {
-    Write-Host "  WARNING: hMailServer service not found. You may need to configure it manually." -ForegroundColor Yellow
-  }
-  
-  # ---------------------------
-  # 8) Deploy Mail API for account registration
-  # ---------------------------
-  Write-Host "Deploying Mail API..."
-  
-  # Create API directory structure
-  if (-not (Test-Path $Config.ApiDir)) {
-    New-Item -ItemType Directory -Force -Path $Config.ApiDir -ErrorAction Stop | Out-Null
-    Write-Host "  Created: $($Config.ApiDir)"
-  }
-  $apiV1Dir = Join-Path $Config.ApiDir "v1"
-  if (-not (Test-Path $apiV1Dir)) {
-    New-Item -ItemType Directory -Force -Path $apiV1Dir -ErrorAction Stop | Out-Null
-    Write-Host "  Created: $apiV1Dir"
-  }
-  $apiLogsDir = Join-Path $Config.ApiDir "logs"
-  if (-not (Test-Path $apiLogsDir)) {
-    New-Item -ItemType Directory -Force -Path $apiLogsDir -ErrorAction Stop | Out-Null
-    Write-Host "  Created: $apiLogsDir"
-  }
-  
-  # Grant IIS write access to logs directory
-  $acl = Get-Acl $apiLogsDir
-  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
-  $acl.SetAccessRule($rule)
-  Set-Acl $apiLogsDir $acl
-  
-  # Copy API PHP files from the script's directory
-  $scriptDir = $PSScriptRoot
-  $sourceApiDir = Join-Path $scriptDir "api"
-  
-  if (Test-Path $sourceApiDir) {
-    Write-Host "  Copying API files from: $sourceApiDir"
-    
-    # Copy all files except config.php (we generate that with correct credentials)
-    Get-ChildItem -Path $sourceApiDir -Recurse | ForEach-Object {
-      $relativePath = $_.FullName.Substring($sourceApiDir.Length + 1)
-      $destPath = Join-Path $Config.ApiDir $relativePath
-      
-      if ($_.PSIsContainer) {
-        # Create directory if it doesn't exist
-        if (-not (Test-Path $destPath)) {
-          New-Item -ItemType Directory -Force -Path $destPath | Out-Null
-        }
-      } else {
-        # Skip config.php - we generate it with correct credentials
-        if ($_.Name -ne "config.php") {
-          Copy-Item -Path $_.FullName -Destination $destPath -Force
-        }
+      $installer = Join-Path $env:TEMP "hMailServer-5.6.8-B2574.exe"
+      try {
+        Download-File $Config.HmailExeUrl $installer
+      } catch {
+        throw "hMailServer download failed (often HTTP 403 from the official site). Download it manually in a browser, set HmailExePath to the local EXE, and re-run."
       }
     }
-    Write-Host "  API files copied successfully" -ForegroundColor Green
-  } else {
-    Write-Host "  WARNING: API source folder not found at: $sourceApiDir" -ForegroundColor Yellow
-    Write-Host "  Please ensure the 'api' folder is in the same directory as this script."
-  }
-  
-  # Generate API config with hMailServer admin password
-  $apiConfig = @"
-<?php
-/**
- * hMailServer API Configuration
- * Generated by Install-MailStack-Windows.ps1
- */
 
-declare(strict_types=1);
-
-return [
-    'hmailserver_admin_password' => '$($Config.HmailAdminPass)',
-    'api_key' => '$($Config.ApiKey)',
-    'allowed_domains' => [],
-    'rate_limit' => 0,
-    'debug' => false,
-    'log_enabled' => true,
-    'log_file' => __DIR__ . '/logs/api.log',
-];
-"@
-  Write-TextFileUtf8NoBom (Join-Path $Config.ApiDir "config.php") $apiConfig
-  
-  Write-Host "Mail API deployed to: $($Config.ApiDir)"
-
-  # ---------------------------
-  # 9) Deploy Admin Panel
-  # ---------------------------
-  Write-Host "Deploying Admin Panel..."
-  
-  # Create admin directory structure
-  if (-not (Test-Path $Config.AdminDir)) {
-    New-Item -ItemType Directory -Force -Path $Config.AdminDir -ErrorAction Stop | Out-Null
-    Write-Host "  Created: $($Config.AdminDir)"
-  }
-  $adminIncludesDir = Join-Path $Config.AdminDir "includes"
-  if (-not (Test-Path $adminIncludesDir)) {
-    New-Item -ItemType Directory -Force -Path $adminIncludesDir -ErrorAction Stop | Out-Null
-    Write-Host "  Created: $adminIncludesDir"
-  }
-  $adminLogsDir = Join-Path $Config.AdminDir "logs"
-  if (-not (Test-Path $adminLogsDir)) {
-    New-Item -ItemType Directory -Force -Path $adminLogsDir -ErrorAction Stop | Out-Null
-    Write-Host "  Created: $adminLogsDir"
-  }
-  
-  # Grant IIS write access to logs directory
-  $acl = Get-Acl $adminLogsDir
-  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
-  $acl.SetAccessRule($rule)
-  Set-Acl $adminLogsDir $acl
-  
-  # Copy admin panel PHP files from the script's directory
-  $scriptDir = $PSScriptRoot
-  $sourceAdminDir = Join-Path $scriptDir "admin"
-  
-  if (Test-Path $sourceAdminDir) {
-    Write-Host "  Copying admin panel files from: $sourceAdminDir"
-    
-    # Copy all files except config.php (we generate that with correct credentials)
-    Get-ChildItem -Path $sourceAdminDir -Recurse | ForEach-Object {
-      $relativePath = $_.FullName.Substring($sourceAdminDir.Length + 1)
-      $destPath = Join-Path $Config.AdminDir $relativePath
-      
-      if ($_.PSIsContainer) {
-        # Create directory if it doesn't exist
-        if (-not (Test-Path $destPath)) {
-          New-Item -ItemType Directory -Force -Path $destPath | Out-Null
-        }
-      } else {
-        # Skip config.php - we generate it with correct credentials
-        if ($_.Name -ne "config.php") {
-          Copy-Item -Path $_.FullName -Destination $destPath -Force
-        }
-      }
+    $p = Start-Process $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait -PassThru
+    if ($p.ExitCode -ne 0) {
+      Write-Log "hMailServer installer exit code: $($p.ExitCode) (check installer UI/logs if needed)" "WARN"
     }
-    Write-Host "  Admin panel files copied successfully" -ForegroundColor Green
-  } else {
-    Write-Host "  WARNING: Admin source folder not found at: $sourceAdminDir" -ForegroundColor Yellow
-    Write-Host "  Please ensure the 'admin' folder is in the same directory as this script."
-  }
-  
-  # Generate config file with correct credentials
-  $adminConfigPhp = @"
-<?php
-/**
- * Admin Panel Configuration
- * Generated by Install-MailStack-Windows.ps1
- */
-declare(strict_types=1);
 
+    if (-not (Test-Path $hmailServerExe)) {
+      throw "hMailServer not found after install. Expected: $hmailServerExe"
+    }
+
+    # Ensure service
+    $svc = Get-Service -Name "hMailServer" -ErrorAction SilentlyContinue
+    if ($svc) {
+      if ($svc.Status -ne "Running") { Start-Service -Name "hMailServer" -ErrorAction SilentlyContinue }
+      Write-Log "hMailServer service status: $((Get-Service hMailServer).Status)" "INFO"
+    } else {
+      Write-Log "hMailServer service not found; check install manually." "WARN"
+    }
+  }
+
+  # ---------------------------
+  # 10) Deploy API + Admin (optional) + web.config lock-down
+  # ---------------------------
+  if ($Config.CreateApiAndAdmin) {
+    Invoke-Step "Deploy API + Admin (optional)" {
+      Import-Module WebAdministration -ErrorAction Stop
+
+      # API
+      Ensure-Directory $Config.ApiDir
+      Ensure-Directory (Join-Path $Config.ApiDir "v1")
+      Ensure-Directory (Join-Path $Config.ApiDir "logs")
+
+      # Admin
+      Ensure-Directory $Config.AdminDir
+      Ensure-Directory (Join-Path $Config.AdminDir "includes")
+      Ensure-Directory (Join-Path $Config.AdminDir "logs")
+
+      # ACL for logs
+      foreach ($logDir in @((Join-Path $Config.ApiDir "logs"), (Join-Path $Config.AdminDir "logs"))) {
+        $acl = Get-Acl $logDir
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS","Modify","ContainerInherit,ObjectInherit","None","Allow")
+        $acl.SetAccessRule($rule)
+        Set-Acl $logDir $acl
+      }
+
+      # Copy from script folders if present
+      $scriptDir = $PSScriptRoot
+
+      $srcApi = Join-Path $scriptDir "api"
+      if (Test-Path $srcApi) {
+        Get-ChildItem -Path $srcApi -Recurse | ForEach-Object {
+          $rel = $_.FullName.Substring($srcApi.Length + 1)
+          $dst = Join-Path $Config.ApiDir $rel
+          if ($_.PSIsContainer) { Ensure-Directory $dst }
+          else {
+            if ($_.Name -ne "config.php") { Copy-Item $_.FullName $dst -Force }
+          }
+        }
+        Write-Log "API files copied." "OK"
+      } else {
+        Write-Log "API source folder not found at: $srcApi (skipping file copy)." "WARN"
+      }
+
+      $srcAdmin = Join-Path $scriptDir "admin"
+      if (Test-Path $srcAdmin) {
+        Get-ChildItem -Path $srcAdmin -Recurse | ForEach-Object {
+          $rel = $_.FullName.Substring($srcAdmin.Length + 1)
+          $dst = Join-Path $Config.AdminDir $rel
+          if ($_.PSIsContainer) { Ensure-Directory $dst }
+          else {
+            if ($_.Name -ne "config.php") { Copy-Item $_.FullName $dst -Force }
+          }
+        }
+        Write-Log "Admin files copied." "OK"
+      } else {
+        Write-Log "Admin source folder not found at: $srcAdmin (skipping file copy)." "WARN"
+      }
+
+      # Generate API config
+      $apiConfig = @"
+<?php
+declare(strict_types=1);
 return [
-    'admin_username' => '$($Config.AdminUsername)',
-    'admin_password' => '$($Config.AdminPassword)',
-    'hmailserver_admin_password' => '$($Config.HmailAdminPass)',
-    'session_name' => 'MAILSERVER_ADMIN',
-    'session_lifetime' => 3600,
-    'app_name' => 'Mail Server Admin',
-    'items_per_page' => 25,
-    'max_login_attempts' => 5,
-    'lockout_duration' => 900,
-    'max_bulk_accounts' => 1000,
-    'default_bulk_count' => 10,
-    'min_password_length' => 4,
-    'log_enabled' => true,
-    'log_file' => __DIR__ . '/logs/admin.log',
+  'hmailserver_admin_password' => '$($Config.HmailAdminPass)',
+  'api_key' => '$($Config.ApiKey)',
+  'allowed_domains' => [],
+  'rate_limit' => 0,
+  'debug' => false,
+  'log_enabled' => true,
+  'log_file' => __DIR__ . '/logs/api.log',
 ];
 "@
-  Write-TextFileUtf8NoBom (Join-Path $Config.AdminDir "config.php") $adminConfigPhp
-  
-  Write-Host "Admin Panel deployed to: $($Config.AdminDir)"
-  
+      Write-TextFileUtf8NoBom (Join-Path $Config.ApiDir "config.php") $apiConfig
+
+      # Generate Admin config
+      $adminConfig = @"
+<?php
+declare(strict_types=1);
+return [
+  'admin_username' => '$($Config.AdminUsername)',
+  'admin_password' => '$($Config.AdminPassword)',
+  'hmailserver_admin_password' => '$($Config.HmailAdminPass)',
+  'session_name' => 'MAILSERVER_ADMIN',
+  'session_lifetime' => 3600,
+  'app_name' => '$($Config.AdminAppName)',
+  'items_per_page' => 25,
+  'max_login_attempts' => 5,
+  'lockout_duration' => 900,
+  'max_bulk_accounts' => $($Config.AdminMaxBulkAccounts),
+  'default_bulk_count' => $($Config.AdminDefaultBulkCount),
+  'min_password_length' => $($Config.AdminMinPasswordLength),
+  'log_enabled' => true,
+  'log_file' => __DIR__ . '/logs/admin.log',
+];
+"@
+      Write-TextFileUtf8NoBom (Join-Path $Config.AdminDir "config.php") $adminConfig
+
+      # Deny HTTP access to config.php + logs (does not block PHP filesystem includes)
+      $lockdown = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <location path="config.php">
+    <system.webServer>
+      <security>
+        <authorization>
+          <deny users="*" />
+        </authorization>
+      </security>
+    </system.webServer>
+  </location>
+  <location path="logs">
+    <system.webServer>
+      <security>
+        <authorization>
+          <deny users="*" />
+        </authorization>
+      </security>
+    </system.webServer>
+  </location>
+</configuration>
+"@
+      Write-TextFileUtf8NoBom (Join-Path $Config.ApiDir "web.config") $lockdown
+      Write-TextFileUtf8NoBom (Join-Path $Config.AdminDir "web.config") $lockdown
+    }
+  }
+
   # ---------------------------
-  # 10) Output next steps
+  # 11) Postflight validation (global, standard)
+  # ---------------------------
+  Invoke-Step "Postflight validation" {
+    # IIS
+    Import-Module WebAdministration -ErrorAction Stop
+    $site = Get-Website -Name $Config.SiteName -ErrorAction Stop
+    if ($site.State -ne "Started") { throw "IIS site '$($Config.SiteName)' is not started." }
+
+    # PHP health check (create temp file, request it locally, then delete)
+    $healthPhp = Join-Path $Config.SitePhysicalPath "_health.php"
+    $healthContent = @"
+<?php
+header('Content-Type: application/json');
+echo json_encode([
+  'php_version' => PHP_VERSION,
+  'extensions' => [
+    'mysqli' => extension_loaded('mysqli'),
+    'pdo_mysql' => extension_loaded('pdo_mysql'),
+    'mbstring' => extension_loaded('mbstring'),
+    'intl' => extension_loaded('intl'),
+    'openssl' => extension_loaded('openssl'),
+    'com_dotnet' => extension_loaded('com_dotnet'),
+  ],
+], JSON_PRETTY_PRINT);
+"@
+    Write-TextFileUtf8NoBom $healthPhp $healthContent
+
+    $url = if ([string]::IsNullOrWhiteSpace($Config.SiteHostHeader)) { "http://127.0.0.1:$($Config.SitePort)/_health.php" }
+           else { "http://127.0.0.1:$($Config.SitePort)/_health.php" } # host header validation would require hosts file; keep simple
+    try {
+      $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
+      if ($resp.StatusCode -ne 200) { throw "PHP health check HTTP $($resp.StatusCode)" }
+      Write-Log "PHP health endpoint responded." "OK"
+    } finally {
+      Remove-Item $healthPhp -Force -ErrorAction SilentlyContinue
+    }
+
+    # MySQL
+    $mysqlExe = Find-MySqlExe
+    & $mysqlExe -uroot -p$($Config.MySqlRootPass) -h 127.0.0.1 -P $Config.MySqlPort --protocol=TCP -e "SELECT VERSION();" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "MySQL root login failed during validation." }
+
+    # Roundcube tables exist?
+    & $mysqlExe -uroot -p$($Config.MySqlRootPass) -h 127.0.0.1 -P $Config.MySqlPort --protocol=TCP `
+      -e "SELECT COUNT(*) AS tables_count FROM information_schema.tables WHERE table_schema='$($Config.RoundcubeDBName)';" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Roundcube DB validation failed." }
+
+    # hMailServer service presence (configuration still required manually)
+    $hm = Get-Service -Name "hMailServer" -ErrorAction SilentlyContinue
+    if (-not $hm) { Write-Log "hMailServer service not found (validate install manually)." "WARN" }
+  }
+
+  # ---------------------------
+  # 12) Output next steps (no secrets dumped beyond what you configured)
   # ---------------------------
   Write-Host ""
   Write-Host "==================== INSTALLATION COMPLETE ===================="
   Write-Host ""
-  Write-Host "URLs:"
-  Write-Host "  Roundcube Webmail: http://<YourIP>/"
-  Write-Host "  Admin Panel:       http://<YourIP>/admin/"
-  Write-Host "  Account API:       POST http://<YourIP>/api/v1/accounts"
-  Write-Host ""
-  Write-Host "Admin Panel Credentials:"
-  Write-Host "  Username: $($Config.AdminUsername)"
-  Write-Host "  Password: $($Config.AdminPassword)"
+  Write-Host "Web:"
+  Write-Host "  Roundcube Webmail: http://<YourIP>:$($Config.SitePort)/"
+  if ($Config.CreateApiAndAdmin) {
+    Write-Host "  Admin Panel:       http://<YourIP>:$($Config.SitePort)/admin/"
+    Write-Host "  Account API:       POST http://<YourIP>:$($Config.SitePort)/api/v1/accounts"
+  }
   Write-Host ""
   Write-Host "hMailServer Configuration (REQUIRED):"
-  Write-Host "  1) Open hMailServer Administrator (Start Menu -> hMailServer)"
-  Write-Host "  2) Connect and set admin password to: $($Config.HmailAdminPass)"
-  Write-Host "  3) Add your domain(s) under 'Domains'"
-  Write-Host "  4) Enable SMTP, IMAP, POP3 protocols as needed"
+  Write-Host "  1) Open hMailServer Administrator"
+  Write-Host "  2) Connect and set admin password to your configured value"
+  Write-Host "  3) Add domain(s) and create accounts (or via your API if implemented)"
+  Write-Host "  4) Enable SMTP/IMAP and configure TLS certificates"
   Write-Host ""
-  Write-Host "Optional:"
-  Write-Host "  - Open firewall ports (25, 110, 143, 587, 993, 995)"
-  Write-Host "  - Configure DNS MX records for your domain"
+  Write-Host "Firewall/DNS reminders:"
+  Write-Host "  - Open ports as needed: 25, 587, 465, 143, 993, 110, 995"
+  Write-Host "  - Configure MX + SPF + DKIM + DMARC for your domain"
   Write-Host ""
-  Write-Host "API Usage (JSON):"
-  Write-Host "  X-API-Key: $($Config.ApiKey)"
-  Write-Host '  curl -X POST http://<IP>/api/v1/accounts -H "Content-Type: application/json" -H "X-API-Key: <API_KEY>" -d "{\"email\":\"user@example.com\",\"password\":\"pass123\"}"'
-  Write-Host "=============================================================="
-  
+  Write-Host "Logs:"
+  Write-Host "  Installer log: $script:LogFile"
+  Write-Host "  Install root:  $($Config.InstallRoot)"
+  Write-Host "==============================================================="
+}
+finally {
+  try { Stop-Transcript | Out-Null } catch { }
+}
