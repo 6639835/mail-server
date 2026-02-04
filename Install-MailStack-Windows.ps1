@@ -198,6 +198,27 @@ $Config = @{
     }
     return $null
   }
+
+  # Utility function: Check if a TCP port is already in use
+  function Test-LocalTcpPortInUse([int]$Port) {
+    try {
+      if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        $conn = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
+        return ($null -ne $conn -and $conn.Count -gt 0)
+      }
+    } catch {
+      # Fall back below
+    }
+
+    try {
+      $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+      $listener.Start()
+      $listener.Stop()
+      return $false
+    } catch {
+      return $true
+    }
+  }
   
   # ---------------------------
   # 2) Install IIS (including FastCGI)
@@ -242,11 +263,36 @@ $Config = @{
     -ScriptProcessor $phpCgi -ResourceType "Either" -ErrorAction SilentlyContinue | Out-Null
 
   # Ensure index.php is a default document (so http://<IP>/ loads Roundcube)
-  Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/defaultDocument/files" -Name "." -Value @{value="index.php"} -ErrorAction SilentlyContinue | Out-Null
+  try {
+    $indexDocFilter = "system.webServer/defaultDocument/files/add[@value='index.php']"
+    $existingIndexDoc = Get-WebConfigurationProperty -PSPath "IIS:\" -Filter $indexDocFilter -Name "value" -ErrorAction SilentlyContinue
+    if (-not $existingIndexDoc) {
+      Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/defaultDocument/files" -Name "." -Value @{value="index.php"} -ErrorAction Stop | Out-Null
+    }
+  } catch {
+    # Ignore if already present/locked by policy
+  }
 
   # Roundcube Elastic skin fonts (IIS may not include these MIME types by default)
-  Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/staticContent" -Name "." -Value @{fileExtension=".woff"; mimeType="application/font-woff"} -ErrorAction SilentlyContinue | Out-Null
-  Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/staticContent" -Name "." -Value @{fileExtension=".woff2"; mimeType="application/font-woff2"} -ErrorAction SilentlyContinue | Out-Null
+  function Ensure-IisMimeMap([string]$fileExtension, [string]$mimeType) {
+    try {
+      $filter = "system.webServer/staticContent/mimeMap[@fileExtension='$fileExtension']"
+      $existing = Get-WebConfigurationProperty -PSPath "IIS:\" -Filter $filter -Name "mimeType" -ErrorAction SilentlyContinue
+      if (-not $existing) {
+        Add-WebConfigurationProperty -PSPath "IIS:\" -Filter "system.webServer/staticContent" -Name "." -Value @{fileExtension=$fileExtension; mimeType=$mimeType} -ErrorAction Stop | Out-Null
+      } else {
+        $current = [string]$existing
+        if ($current -ne $mimeType) {
+          Set-WebConfigurationProperty -PSPath "IIS:\" -Filter $filter -Name "mimeType" -Value $mimeType -ErrorAction SilentlyContinue | Out-Null
+        }
+      }
+    } catch {
+      # Duplicate entries can exist (e.g., already configured); ignore.
+    }
+  }
+
+  Ensure-IisMimeMap ".woff"  "application/font-woff"
+  Ensure-IisMimeMap ".woff2" "application/font-woff2"
   
   iisreset | Out-Null
   
@@ -255,6 +301,10 @@ $Config = @{
   #   - PASSWORD / SERVICENAME / PORT etc. are officially supported MSI properties
   # ---------------------------
   Write-Host "Installing MariaDB..."
+  $existingMysql = Find-MySqlExe
+  if ($existingMysql) {
+    Write-Host "  MariaDB appears to be already installed (found mysql.exe). Skipping MSI install." -ForegroundColor Yellow
+  } else {
   $mariadbMsiName = "mariadb-12.1.2-winx64.msi"
   $mariadbMsi = $null
 
@@ -272,17 +322,45 @@ $Config = @{
     }
   }
   
+  # If the requested port is already in use, pick the next available port.
+  if (Test-LocalTcpPortInUse ([int]$Config.MariaDbPort)) {
+    $originalPort = [int]$Config.MariaDbPort
+    Write-Host "  WARNING: MariaDB port $originalPort is already in use. Selecting a free port..." -ForegroundColor Yellow
+    $picked = $false
+    for ($p = $originalPort + 1; $p -le ($originalPort + 50); $p++) {
+      if (-not (Test-LocalTcpPortInUse $p)) {
+        $Config.MariaDbPort = $p
+        $picked = $true
+        break
+      }
+    }
+    if ($picked) {
+      Write-Host "  Using MariaDB port: $($Config.MariaDbPort)" -ForegroundColor Yellow
+    } else {
+      throw "MariaDB port $originalPort is in use and no free port was found nearby. Please stop the conflicting service or set MariaDbPort."
+    }
+  }
+
+  $mariaLog = Join-Path $env:TEMP ("mariadb-install-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+  Write-Host "  MariaDB MSI log: $mariaLog"
+
+  # Build argument list as an array to avoid quoting issues
   $msiArgs = @(
-    "/i `"$mariadbMsi`"",
-    "/qn",
+    "/i", "`"$mariadbMsi`"",
     "SERVICENAME=$($Config.MariaDbService)",
     "PASSWORD=$($Config.MariaDbRootPass)",
-    "PORT=$($Config.MariaDbPort)"
-  ) -join " "
-  
+    "PORT=$($Config.MariaDbPort)",
+    "ALLOWREMOTEROOTACCESS=",
+    "DEFAULTUSER=",
+    "SKIPNETWORKING=",
+    "/qn",
+    "/l*v", "`"$mariaLog`""
+  )
+
   $mariaInstall = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
   if ($mariaInstall.ExitCode -ne 0) {
-    throw "MariaDB installer failed (exit code: $($mariaInstall.ExitCode))"
+    throw "MariaDB installer failed (exit code: $($mariaInstall.ExitCode)). Please send the log content from: $mariaLog"
+  }
   }
   
   Start-Sleep -Seconds 3
