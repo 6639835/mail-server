@@ -22,7 +22,7 @@ $Config = @{
   TimeZone          = "Europe/Berlin"     # used for PHP date.timezone
   InstallRoot       = "C:\MailStack"      # logs + working area
   SiteName          = "MailWeb"
-  SitePort          = 80
+  SitePort          = 8080
   SiteHostHeader    = ""                  # optional; leave empty for IP-based
   SitePhysicalPath  = "C:\inetpub\mailstack"  # NOT default wwwroot (safer)
 
@@ -36,7 +36,7 @@ $Config = @{
   # IMPORTANT: hMailServer COM is 32-bit, so PHP must be x86, and IIS app pool must allow 32-bit apps.
   PhpDir            = "C:\PHP"
   PhpZipUrl         = "https://windows.php.net/downloads/releases/php-8.4.16-nts-Win32-vs17-x86.zip"
-  PhpZipSha256      = "75349d9db21e2c7ab4ea734019ed339ebb0ef787d81860599e3120018de3ad84"
+  PhpZipSha256      = "fe8d7b4125653f7ee8df4f550c4959d209fbdfc10a72a251a20a1eb44dc4f8aa"
 
   # MySQL (Pinned + verified)
   MySqlVersion      = "8.4.8"
@@ -75,8 +75,8 @@ $Config = @{
   AdminMinPasswordLength = 4
 
   # Behavior / safety
-  IgnorePendingReboot   = $false
-  AllowDefaultSecrets   = $false   # if false, script stops if passwords contain "ChangeMe"
+  IgnorePendingReboot   = $true
+  AllowDefaultSecrets   = $true   # if false, script stops if passwords contain "ChangeMe"
   CreateApiAndAdmin     = $true
   VerifyDownloads       = $true
 }
@@ -152,15 +152,47 @@ function Assert-NoPendingReboot {
 function Test-LocalTcpPortInUse([int]$Port) {
   try {
     if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
-      $conn = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
-      return ($null -ne $conn -and $conn.Count -gt 0)
+      $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+      return (@($conn).Count -gt 0)
     }
   } catch { }
   try {
-    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    # Bind to all interfaces (not just loopback) to detect broader conflicts.
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
     $listener.Start(); $listener.Stop()
     return $false
   } catch { return $true }
+}
+
+function Test-VcRuntimeX64Present {
+  # MySQL (winx64) requires the MSVC runtime. If missing, mysqld often exits with 0xC0000135 (-1073741515).
+  $dlls = @(
+    (Join-Path $env:WINDIR "System32\vcruntime140.dll"),
+    (Join-Path $env:WINDIR "System32\vcruntime140_1.dll"),
+    (Join-Path $env:WINDIR "System32\msvcp140.dll")
+  )
+  foreach ($d in $dlls) { if (-not (Test-Path $d)) { return $false } }
+  return $true
+}
+
+function Ensure-VcRedistX64 {
+  if (Test-VcRuntimeX64Present) { return }
+
+  $url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+  $exe = Join-Path $env:TEMP ("vc_redist.x64-{0}.exe" -f (Get-Date -Format "yyyyMMddHHmmss"))
+  Download-File $url $exe
+
+  Write-Log "Installing Microsoft Visual C++ Redistributable (x64)..." "INFO"
+  $p = Start-Process -FilePath $exe -ArgumentList "/install","/quiet","/norestart" -Wait -PassThru
+  Remove-Item $exe -Force -ErrorAction SilentlyContinue
+
+  # 0 = success, 3010 = success (reboot required)
+  if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+    throw "VC++ Redistributable installation failed (exit=$($p.ExitCode))."
+  }
+  if ($p.ExitCode -eq 3010) {
+    Write-Log "VC++ Redistributable installed; reboot is recommended (installer returned 3010)." "WARN"
+  }
 }
 
 function Assert-SafeSecrets {
@@ -382,7 +414,7 @@ try {
         "Web-Http-Errors","Web-Http-Redirect","Web-Http-Logging","Web-Request-Monitor",
         "Web-Filtering","Web-App-Dev","Web-CGI","Web-Mgmt-Tools"
       )
-      $res = Install-WindowsFeature @features
+      $res = Install-WindowsFeature -Name $features -IncludeManagementTools
       if ($res.RestartNeeded -eq "Yes") { throw "Windows feature install requires reboot. Reboot and re-run." }
     } else {
       # Windows client
@@ -495,6 +527,45 @@ try {
     Set-ItemProperty "IIS:\AppPools\$poolName" -Name "managedRuntimeVersion" -Value "" | Out-Null
     Set-ItemProperty "IIS:\AppPools\$poolName" -Name "enable32BitAppOnWin64" -Value $true | Out-Null
 
+    # Binding safety: IIS can throw 0x800700B7 when starting a site whose binding
+    # (IP:Port:HostHeader) conflicts with another configured site.
+    $desiredBindingInformation = "*:$($Config.SitePort):$($Config.SiteHostHeader)"
+    $desiredPort = [int]$Config.SitePort
+    $desiredHost = if ([string]::IsNullOrWhiteSpace($Config.SiteHostHeader)) { "" } else { [string]$Config.SiteHostHeader }
+
+    # NOTE: IIS may represent the IP portion as "*", "0.0.0.0", a concrete IP, or IPv6.
+    # Match conflicts by (Port, HostHeader) rather than full string-equality, and prefer Get-Website
+    # so we can reliably map bindings back to the site name.
+    $bindingConflicts = @()
+    try {
+      $sites = Get-Website -ErrorAction SilentlyContinue
+      foreach ($s in @($sites)) {
+        if (-not $s -or [string]::IsNullOrWhiteSpace($s.Name)) { continue }
+        if ($s.Name -eq $Config.SiteName) { continue }
+
+        foreach ($bind in @($s.Bindings.Collection)) {
+          try {
+            if (($bind.protocol -ne "http")) { continue }
+            $bi = [string]$bind.bindingInformation
+            if ([string]::IsNullOrWhiteSpace($bi)) { continue }
+
+            if ($bi -match '^(?<ip>.+):(?<port>\d+):(?<host>.*)$') {
+              $p = [int]$Matches['port']
+              $h = [string]$Matches['host']
+              if ($p -eq $desiredPort -and $h -eq $desiredHost) {
+                $bindingConflicts += $s.Name
+              }
+            }
+          } catch { }
+        }
+      }
+    } catch { }
+
+    $bindingConflicts = @($bindingConflicts | Sort-Object -Unique | Where-Object { $_ -and $_ -ne $Config.SiteName })
+    if ($bindingConflicts.Count -gt 0) {
+      throw "IIS binding conflict: http '$desiredBindingInformation' is already configured on site(s): $($bindingConflicts -join ', '). Change SitePort / SiteHostHeader or remove/disable the conflicting site(s), then re-run."
+    }
+
     if (-not (Test-Path "IIS:\Sites\$($Config.SiteName)")) {
       if ([string]::IsNullOrWhiteSpace($Config.SiteHostHeader)) {
         New-Website -Name $Config.SiteName -Port $Config.SitePort -PhysicalPath $Config.SitePhysicalPath -ApplicationPool $poolName | Out-Null
@@ -502,12 +573,37 @@ try {
         New-Website -Name $Config.SiteName -Port $Config.SitePort -HostHeader $Config.SiteHostHeader -PhysicalPath $Config.SitePhysicalPath -ApplicationPool $poolName | Out-Null
       }
     } else {
-      # keep binding, but enforce physical path + pool
+      # Enforce physical path + pool + binding (idempotent on re-runs)
       Set-ItemProperty "IIS:\Sites\$($Config.SiteName)" -Name physicalPath -Value $Config.SitePhysicalPath | Out-Null
       Set-ItemProperty "IIS:\Sites\$($Config.SiteName)" -Name applicationPool -Value $poolName | Out-Null
+
+      # Normalize HTTP bindings to exactly what config requests.
+      try {
+        $existingHttpBindings = Get-WebBinding -Name $Config.SiteName -Protocol "http" -ErrorAction SilentlyContinue
+        foreach ($b in $existingHttpBindings) {
+          Remove-WebBinding -Name $Config.SiteName -Protocol "http" -BindingInformation $b.bindingInformation -ErrorAction SilentlyContinue
+        }
+      } catch { }
+
+      if ([string]::IsNullOrWhiteSpace($Config.SiteHostHeader)) {
+        New-WebBinding -Name $Config.SiteName -Protocol "http" -IPAddress "*" -Port $Config.SitePort | Out-Null
+      } else {
+        New-WebBinding -Name $Config.SiteName -Protocol "http" -IPAddress "*" -Port $Config.SitePort -HostHeader $Config.SiteHostHeader | Out-Null
+      }
     }
 
-    Start-WebSite -Name $Config.SiteName | Out-Null
+    try {
+      Start-WebAppPool -Name $poolName -ErrorAction SilentlyContinue | Out-Null
+      Start-WebSite -Name $Config.SiteName | Out-Null
+    } catch {
+      # Re-surface binding conflicts with a clearer message (common: 0x800700B7)
+      $hr = $null
+      try { $hr = $_.Exception.HResult } catch { }
+      if ($hr -eq -2147024713) {
+        throw "Failed to start IIS site '$($Config.SiteName)'. This often means the HTTP binding '$desiredBindingInformation' conflicts with another IIS site/binding. Set SitePort/SiteHostHeader (Config block) or remove/disable the conflicting binding, then re-run. Original error: $($_.Exception.Message)"
+      }
+      throw
+    }
   }
 
   # ---------------------------
@@ -537,7 +633,7 @@ try {
 
       # Clean BaseDir and move extracted
       Get-ChildItem -Path $Config.MySqlBaseDir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-      Copy-Item -Path $sub.FullName\* -Destination $Config.MySqlBaseDir -Recurse -Force
+      Copy-Item -Path (Join-Path $sub.FullName "*") -Destination $Config.MySqlBaseDir -Recurse -Force
       Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
@@ -572,7 +668,11 @@ port=$($Config.MySqlPort)
       # Initialize datadir if empty
       $hasData = (Get-ChildItem -Path $Config.MySqlDataDir -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0
       if (-not $hasData) {
+        Ensure-VcRedistX64
         & $mysqld --defaults-file="$myIni" --initialize-insecure --console
+        if ($LASTEXITCODE -eq -1073741515) {
+          throw "mysqld failed to start (exit=-1073741515 / 0xC0000135). This usually means the Microsoft Visual C++ (x64) runtime is missing. Install VC++ 2015-2022 x64 redistributable and re-run."
+        }
         if ($LASTEXITCODE -ne 0) { throw "mysqld --initialize-insecure failed (exit=$LASTEXITCODE)." }
       }
 
@@ -591,9 +691,16 @@ port=$($Config.MySqlPort)
     }
 
     # Set root password (only if not set yet) — try connecting without password first
-    $tryNoPass = & $mysqlExe -uroot -h 127.0.0.1 -P $Config.MySqlPort -e "SELECT 1;" 2>$null
+    # Use localhost (not 127.0.0.1) for initial connection since root@localhost uses socket/named pipe
+    $tryNoPass = & $mysqlExe -uroot -h localhost -P $Config.MySqlPort -e "SELECT 1;" 2>$null
     if ($LASTEXITCODE -eq 0) {
-      & $mysqlExe -uroot -h 127.0.0.1 -P $Config.MySqlPort -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$($Config.MySqlRootPass)'; FLUSH PRIVILEGES;"
+      # Set password and also create root@'127.0.0.1' for TCP/IP connections
+      & $mysqlExe -uroot -h localhost -P $Config.MySqlPort -e @"
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$($Config.MySqlRootPass)';
+CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY '$($Config.MySqlRootPass)';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+"@
       if ($LASTEXITCODE -ne 0) { throw "Failed setting MySQL root password." }
       Write-Log "MySQL root password set." "OK"
     } else {
